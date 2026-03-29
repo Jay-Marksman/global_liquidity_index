@@ -132,17 +132,40 @@ def build_gli(df: pd.DataFrame) -> pd.Series:
     return gli.rename("GLI_USD_B")
 
 def plot_gli(gli: pd.Series, market: pd.DataFrame):
-    df = pd.concat([gli, market], axis=1).dropna(how="all")
-    if df.empty:
-        st.error("No data available after alignment.")
+    if gli.empty and market.empty:
+        st.error("No data was fetched for GLI or markets.")
         return None
+
+    df = pd.concat([gli, market], axis=1).sort_index()
     
-    first = df.dropna().index[0]
+    # Diagnostic info
+    st.caption(f"Data shape: {df.shape} | GLI non-NaN: {gli.notna().sum()} | Market non-NaN: {market.notna().sum().sum()}")
+
+    # Drop rows where ALL columns are NaN, but keep rows with partial data
+    df = df.dropna(how="all")
+    
+    if df.empty:
+        st.error("No overlapping data available after alignment. Check date range or API key.")
+        return None
+
+    # Find the first date where we have at least the GLI or one market
+    valid_df = df.dropna(subset=["GLI_USD_B", "SPY", "BTC-USD"], how="all")
+    if valid_df.empty:
+        st.warning("No date has both GLI and market data. Showing available series separately.")
+        valid_df = df  # fallback
+
+    first = valid_df.index[0]
+
+    # Index to 100 from the first valid date
     idx = df.loc[first:].div(df.loc[first]) * 100
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28],
-                        vertical_spacing=0.04,
-                        subplot_titles=("Indexed Performance (start = 100)", "GLI (USD Trillions)"))
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.04,
+        subplot_titles=("Indexed Performance (start = 100)", "GLI (USD Trillions)")
+    )
 
     colors = {"GLI_USD_B": "#3266ad", "SPY": "#1D9E75", "BTC-USD": "#D85A30"}
     names = {"GLI_USD_B": "Global Liquidity Index", "SPY": "SPY", "BTC-USD": "BTC/USD"}
@@ -150,16 +173,22 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     for col in ["GLI_USD_B", "SPY", "BTC-USD"]:
         if col in idx.columns:
             fig.add_trace(go.Scatter(
-                x=idx.index, y=idx[col].round(1),
-                name=names[col], mode="lines",
+                x=idx.index, 
+                y=idx[col].round(1),
+                name=names[col], 
+                mode="lines",
                 line=dict(color=colors[col], width=2.5 if col == "GLI_USD_B" else 1.5)
             ), row=1, col=1)
 
+    # Bottom panel: raw GLI in trillions
     if "GLI_USD_B" in df.columns:
         fig.add_trace(go.Scatter(
-            x=df.index, y=(df["GLI_USD_B"] / 1000).round(2),
-            name="GLI (raw)", mode="lines",
-            line=dict(color="#3266ad", width=1.5), showlegend=False
+            x=df.index, 
+            y=(df["GLI_USD_B"] / 1000).round(2),
+            name="GLI (raw)", 
+            mode="lines",
+            line=dict(color="#3266ad", width=1.5), 
+            showlegend=False
         ), row=2, col=1)
 
     fig.update_layout(
@@ -167,14 +196,14 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
         hovermode="x unified",
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        height=750
+        height=750,
+        margin=dict(l=50, r=50, t=80, b=50)
     )
     fig.update_yaxes(title_text="Indexed (start=100)", row=1, col=1)
     fig.update_yaxes(title_text="USD Trillions", row=2, col=1)
     fig.update_xaxes(title_text="Date", row=2, col=1)
     
     return fig
-
 # ── Main execution ──────────────────────────────────────────────────────────
 start_str = START_DATE.strftime("%Y-%m-%d")
 end_str = datetime.today().strftime("%Y-%m-%d")
@@ -191,21 +220,21 @@ FRED_SERIES = {
     "DEXSZUS": "CHF_USD_INV",
 }
 
-with st.spinner("Fetching central bank and market data... (first load can take 20–50 seconds)"):
+with st.spinner("Fetching central bank and market data... (first load can take 30–60 seconds)"):
     raw = {}
     for series_id, name in FRED_SERIES.items():
         try:
             raw[name] = get_fred_series(series_id, name, start_str)
         except Exception as e:
-            st.warning(f"FRED series {series_id} failed: {e}")
+            st.warning(f"FRED {series_id} failed: {e}")
 
     raw["ECB"] = get_ecb_total_assets(start_str)
     raw["BOJ"] = get_boj_total_assets(start_str)
     raw["PBC"] = get_pboc_total_assets(start_str)
     raw["RBA"] = get_rba_total_assets(start_str)
 
-    df = pd.DataFrame(raw).sort_index().ffill()
-    gli = build_gli(df)
+    df_raw = pd.DataFrame(raw).sort_index().ffill()
+    gli = build_gli(df_raw)
     market = get_market_data(start_str, end_str)
 
     fig = plot_gli(gli, market)
@@ -213,8 +242,11 @@ with st.spinner("Fetching central bank and market data... (first load can take 2
 if fig:
     st.plotly_chart(fig, use_container_width=True)
 
-if st.checkbox("Show raw data"):
+if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
-    st.dataframe(combined.style.format("{:,.2f}"))
-
+    if not combined.empty:
+        st.dataframe(combined.style.format("{:,.2f}"))
+    else:
+        st.info("No combined data available yet.")
+        
 st.caption("Data is cached for 24 hours (central banks) and 1 hour (market). Some smaller central banks are still missing.")
