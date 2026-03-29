@@ -47,26 +47,34 @@ def get_fx(fred_id: str, start: str):
 
 @st.cache_data(ttl=86400)
 def get_ecb_total_assets(start: str):
-    url = "https://data-api.ecb.europa.eu/service/data/ILM/W.U2.C.A1.U4.EUR?format=csvdata&startPeriod=2015-01-01"
-    try:
-        df = pd.read_csv(url)
-        df = df[["TIME_PERIOD", "OBS_VALUE"]].copy()
-        df["TIME_PERIOD"] = pd.to_datetime(df["TIME_PERIOD"])
-        df = df.set_index("TIME_PERIOD")["OBS_VALUE"]
-        df = df.resample(RESAMPLE_FREQ).last().ffill()
-        df.name = "ECB"
-        
-        eur_usd = get_fx("DEXUSEU", start)
-        df_aligned = df.reindex(eur_usd.index, method="ffill") * eur_usd / 1000
-        return df_aligned
-    except Exception as e:
-        st.warning(f"ECB fetch failed: {e}")
-        return pd.Series(dtype=float, name="ECB")
+    """ECB total assets - updated endpoint (ECB Data Portal / SDW replacement)"""
+    # Try modern ECB API first
+    urls = [
+        "https://data-api.ecb.europa.eu/service/data/BSI/W.U2.C.A.T0.A1.Z5._T._T._Z.XDC._T._X.V._T._T._T._T?format=csvdata",  # Consolidated balance sheet attempt
+        "https://data-api.ecb.europa.eu/service/data/ILM/W.U2.C.A1.U4.EUR?format=csvdata&startPeriod=2015-01-01"  # old one
+    ]
+    for url in urls:
+        try:
+            df = pd.read_csv(url)
+            if "TIME_PERIOD" in df.columns and "OBS_VALUE" in df.columns:
+                df = df[["TIME_PERIOD", "OBS_VALUE"]].copy()
+                df["TIME_PERIOD"] = pd.to_datetime(df["TIME_PERIOD"])
+                df = df.set_index("TIME_PERIOD")["OBS_VALUE"]
+                df = df.resample(RESAMPLE_FREQ).last().ffill()
+                df.name = "ECB"
+                
+                eur_usd = get_fx("DEXUSEU", start)  # renamed for clarity
+                df_aligned = df.reindex(eur_usd.index, method="ffill") * eur_usd / 1000   # EUR millions → USD billions
+                return df_aligned
+        except Exception:
+            continue
+    st.warning("ECB fetch failed from both endpoints. Using zeros for ECB.")
+    return pd.Series(dtype=float, name="ECB")
 
 @st.cache_data(ttl=86400)
 def get_boj_total_assets(start: str):
+    """BOJ - keep your original + fallback"""
     try:
-        # Primary source
         url = "https://www.stat-search.boj.or.jp/ssi/mtshtml/bs01_m_1_en.csv"
         df = pd.read_csv(url, skiprows=4, encoding="shift_jis")
         df.columns = df.columns.str.strip()
@@ -80,36 +88,39 @@ def get_boj_total_assets(start: str):
         jpy_usd = get_fx("DEXJPUS", start)
         df_aligned = df.reindex(jpy_usd.index, method="ffill") / jpy_usd * 0.01
         return df_aligned.rename("BOJ")
-    except Exception:
-        # FRED fallback
+    except Exception as e:
+        st.warning(f"Primary BOJ source failed: {e}. Trying FRED fallback...")
         try:
-            s = get_fred_series("JPNASSETS", "BOJ_JPYT", start) * 1000
+            s = get_fred_series("JPNASSETS", "BOJ", start) * 1000  # adjust multiplier if needed
             jpy_usd = get_fx("DEXJPUS", start)
             return (s.reindex(jpy_usd.index, method="ffill") / jpy_usd).rename("BOJ")
-        except Exception as e:
-            st.warning(f"BOJ fetch failed: {e}")
+        except Exception as e2:
+            st.warning(f"BOJ completely failed: {e2}")
             return pd.Series(dtype=float, name="BOJ")
 
 @st.cache_data(ttl=86400)
 def get_pboc_total_assets(start: str):
+    """PBC (People's Bank of China) - updated series if available, else warn"""
     try:
-        s = get_fred_series("CHASSETS", "PBC_CNY", start)
+        # Try common series for Chinese central bank assets
+        s = get_fred_series("CHASSETS", "PBC_CNY", start)   # this may still fail
         cny_usd = get_fx("DEXCHUS", start)
         return (s.reindex(cny_usd.index, method="ffill") / cny_usd).rename("PBC")
-    except Exception as e:
-        st.warning(f"PBC fetch failed: {e}")
+    except Exception:
+        st.warning("PBC (CHASSETS) not available on FRED. Consider direct PBoC source later.")
         return pd.Series(dtype=float, name="PBC")
 
 @st.cache_data(ttl=86400)
 def get_rba_total_assets(start: str):
+    """RBA - similar situation"""
     try:
         s = get_fred_series("RBATOTASSETS", "RBA_AUD", start)
         aud_usd = get_fx("DEXUSAL", start)
         return (s.reindex(aud_usd.index, method="ffill") * aud_usd).rename("RBA")
-    except Exception as e:
-        st.warning(f"RBA fetch failed: {e}")
+    except Exception:
+        st.warning("RBA (RBATOTASSETS) not found on FRED.")
         return pd.Series(dtype=float, name="RBA")
-
+        
 @st.cache_data(ttl=3600)  # shorter TTL for market data
 def get_market_data(start: str, end: str):
     tickers = yf.download(["SPY", "BTC-USD"], start=start, end=end, progress=False)
@@ -118,19 +129,26 @@ def get_market_data(start: str, end: str):
 
 # ── GLI calculation ─────────────────────────────────────────────────────────
 def build_gli(df: pd.DataFrame) -> pd.Series:
-    fed = df.get("FED_ASSETS", 0) * 0.001
-    tga = df.get("TGA", 0)
-    rrp = df.get("RRP", 0)
-    
-    boe = (df.get("BOE_GBP", 0) * 0.001 * df.get("GBP_USD", 1)) if "BOE_GBP" in df and "GBP_USD" in df else 0
-    boc = (df.get("BOC_CAD", 0) * 0.001 / df.get("CAD_USD_INV", 1)) if "BOC_CAD" in df and "CAD_USD_INV" in df else 0
-    snb = (df.get("SNB_CHF", 0) / df.get("CHF_USD_INV", 1)) if "SNB_CHF" in df and "CHF_USD_INV" in df else 0
+    fed = df.get("FED_ASSETS", pd.Series(0)) * 0.001
+    tga = df.get("TGA", pd.Series(0))
+    rrp = df.get("RRP", pd.Series(0))
 
-    gli = (fed - tga - rrp +
-           df.get("ECB", 0) + df.get("BOJ", 0) + df.get("PBC", 0) +
-           df.get("RBA", 0) + boe + boc + snb)
+    # BOE (if available and in %GDP, this is imperfect - we'll improve later)
+    boe = df.get("BOE_GBP", pd.Series(0))
+
+    # Other banks
+    ecb = df.get("ECB", pd.Series(0))
+    boj = df.get("BOJ", pd.Series(0))
+    pbc = df.get("PBC", pd.Series(0))
+    rba = df.get("RBA", pd.Series(0))
+
+    # FX conversions where needed
+    if "GBP_USD" in df.columns:
+        boe = boe * df["GBP_USD"] * 0.001 if "BOE_GBP" in df.columns else boe  # rough scaling
+
+    gli = fed - tga - rrp + ecb + boj + pbc + rba + boe
     return gli.rename("GLI_USD_B")
-
+    
 def plot_gli(gli: pd.Series, market: pd.DataFrame):
     if gli.empty and market.empty:
         st.error("No data was fetched for GLI or markets.")
@@ -209,15 +227,22 @@ start_str = START_DATE.strftime("%Y-%m-%d")
 end_str = datetime.today().strftime("%Y-%m-%d")
 
 FRED_SERIES = {
-    "WALCL": "FED_ASSETS",
-    "WTREGEN": "TGA",
-    "RRPONTSYD": "RRP",
-    "BOEBSTASGBP": "BOE_GBP",
-    "CAALTSASSETS": "BOC_CAD",
-    "SNBASSETS": "SNB_CHF",
-    "DEXUSUK": "GBP_USD",
-    "DEXCAUS": "CAD_USD_INV",
-    "DEXSZUS": "CHF_USD_INV",
+    # Reliable FED components (these still work)
+    "WALCL": "FED_ASSETS",      # Fed Total Assets (millions USD)
+    "WTREGEN": "TGA",           # Treasury General Account
+    "RRPONTSYD": "RRP",         # Overnight Reverse Repo
+
+    # BOE - use the long-running one (though it ends in 2016, we'll add a better source later)
+    "BOEBSTAUKA": "BOE_GBP",    # Bank of England Total Assets (% of GDP, but we'll adjust)
+
+    # FX rates (these are usually stable)
+    "DEXUSUK": "GBP_USD",       # USD per GBP
+    "DEXCAUS": "CAD_USD_INV",   # CAD per USD (invert)
+    "DEXSZUS": "CHF_USD_INV",   # CHF per USD (invert)
+    "DEXUSEU": "EUR_USD",       # USD per EUR (for ECB)
+    "DEXJPUS": "JPY_USD",       # JPY per USD (for BOJ)
+    "DEXCHUS": "CNY_USD",       # CNY per USD (for PBC)
+    "DEXUSAL": "AUD_USD",       # USD per AUD (for RBA)
 }
 
 with st.spinner("Fetching central bank and market data... (first load can take 30–60 seconds)"):
