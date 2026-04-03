@@ -223,7 +223,8 @@ FRED_SERIES = {
 }
 
 with st.spinner("Fetching data... (first run can take 30-60 seconds)"):
- raw = {}
+
+raw = {}
     for sid, name in FRED_SERIES.items():
         raw[name] = get_fred_series(sid, name, start_str)
 
