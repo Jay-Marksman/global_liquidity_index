@@ -8,29 +8,28 @@ from datetime import datetime
 
 st.set_page_config(page_title="Global Liquidity Index vs SPY & BTC", layout="wide")
 st.title("🌍 Global Liquidity Index vs SPY & BTC")
-st.markdown("**Global Liquidity Index** from major central banks vs SPY and Bitcoin. Enter your FRED API key below.")
+st.markdown("**Global Liquidity Index** (FED + ECB + BOJ + others) vs SPY and Bitcoin.")
 
-# ── Sidebar ─────────────────────────────────────────────────────────────
+# Sidebar
 with st.sidebar:
     st.header("Configuration")
     FRED_API_KEY = st.text_input("FRED API Key", type="password",
-                                 help="Get free key at https://fred.stlouisfed.org/docs/api/api_key.html")
+                                 help="Free key: https://fred.stlouisfed.org/docs/api/api_key.html")
     START_DATE = st.date_input("Start Date", value=datetime(2015, 1, 1))
 
     if not FRED_API_KEY:
-        st.warning("⚠️ Please enter your FRED API key")
+        st.warning("Enter your FRED API key")
         st.stop()
 
-# ── Fred client ─────────────────────────────────────────────────────────
+# Fred client
 @st.cache_resource
 def get_fred_client(_api_key):
     return Fred(api_key=_api_key)
 
 fred = get_fred_client(FRED_API_KEY)
-
 RESAMPLE_FREQ = "W-FRI"
 
-# ── Cached data fetchers ────────────────────────────────────────────────
+# Cached fetchers
 @st.cache_data(ttl=86400)
 def get_fred_series(series_id: str, name: str, start: str):
     try:
@@ -53,7 +52,7 @@ def get_ecb_total_assets(start: str):
         eur_usd = get_fx("DEXUSEU", start)
         return (s.reindex(eur_usd.index, method="ffill") * eur_usd / 1000).rename("ECB")
     except Exception as e:
-        st.warning(f"ECB failed: {e}")
+        st.warning(f"ECB: {e}")
         return pd.Series(dtype=float, name="ECB")
 
 @st.cache_data(ttl=86400)
@@ -77,70 +76,45 @@ def get_boj_total_assets(start: str):
             jpy_usd = get_fx("DEXJPUS", start)
             return (s.reindex(jpy_usd.index, method="ffill") / jpy_usd).rename("BOJ")
         except Exception as e:
-            st.warning(f"BOJ failed: {e}")
+            st.warning(f"BOJ: {e}")
             return pd.Series(dtype=float, name="BOJ")
 
 @st.cache_data(ttl=86400)
 def get_boe_total_assets(start: str):
-    """Bank of England - direct weekly report"""
-    try:
-        url = "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018&TD=31&TM=Dec&TY=2027&FNY=Y&CSVF=TT&html.x=66&html.y=26&SeriesCodes=RPWB55A,RPWB56A,RPWB59A,RPWB67A,RPWZ4TJ,RPWZ4TK,RPWZOQ4,RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20England%20Weekly%20Report&VPD=Y"
-        df = pd.read_csv(url, skiprows=1)
-        df.columns = [col.strip() for col in df.columns]
-        
-        # Find date and total assets column (BOE columns change slightly)
-        date_col = next((col for col in df.columns if "date" in col.lower() or "period" in col.lower()), None)
-        asset_col = next((col for col in df.columns if "asset" in col.lower() and "total" in col.lower()), None)
-        
-        if not date_col or not asset_col:
-            raise ValueError("Could not locate date or assets column")
-        
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col]).set_index(date_col)
-        assets = pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
-        assets = assets.resample(RESAMPLE_FREQ).last().ffill()
-        
-        gbp_usd = get_fx("DEXUSUK", start)
-        return (assets.reindex(gbp_usd.index, method="ffill") * gbp_usd / 1000).rename("BOE")
-    except Exception as e:
-        st.warning(f"BOE direct fetch failed: {e}. Skipping BOE for now.")
-        return pd.Series(dtype=float, name="BOE")
+    """Simplified BOE - disabled for now due to 403. Can be re-enabled with better scraper later."""
+    st.info("BOE direct fetch temporarily disabled (403 error).")
+    return pd.Series(dtype=float, name="BOE")
 
-@st.cache_data(ttl=86400)
-def get_snb_total_assets(start: str):
-    try:
-        s = get_fred_series("SNBASSETS", "SNB_CHF", start)
-        chf_usd = get_fx("DEXSZUS", start)  # CHF per USD → invert
-        return (s.reindex(chf_usd.index, method="ffill") / chf_usd).rename("SNB")
-    except Exception as e:
-        st.warning(f"SNB failed: {e}")
-        return pd.Series(dtype=float, name="SNB")
-
-# ── GLI Calculation ─────────────────────────────────────────────────────
+# GLI Calculation
 def build_gli(df: pd.DataFrame) -> pd.Series:
     fed = df.get("FED_ASSETS", pd.Series(0)) * 0.001
     tga = df.get("TGA", pd.Series(0))
     rrp = df.get("RRP", pd.Series(0))
-    
     ecb = df.get("ECB", pd.Series(0))
     boj = df.get("BOJ", pd.Series(0))
     boe = df.get("BOE", pd.Series(0))
-    snb = df.get("SNB", pd.Series(0))
 
-    gli = fed - tga - rrp + ecb + boj + boe + snb
+    gli = fed - tga - rrp + ecb + boj + boe
     return gli.rename("GLI_USD_B")
 
-# ── Market Data ─────────────────────────────────────────────────────────
+# Market data
 @st.cache_data(ttl=3600)
 def get_market_data(start: str, end: str):
     tickers = yf.download(["SPY", "BTC-USD"], start=start, end=end, progress=False)
     return tickers["Close"].resample(RESAMPLE_FREQ).last().ffill()
 
-# ── Plot ────────────────────────────────────────────────────────────────
+# Plot (fixed index type issue)
 def plot_gli(gli: pd.Series, market: pd.DataFrame):
-    df = pd.concat([gli, market], axis=1).sort_index().dropna(how="all")
+    df = pd.concat([gli, market], axis=1)
+    
+    # Force datetime index to prevent mixed type error
+    if not pd.api.types.is_datetime64_any_dtype(df.index):
+        df.index = pd.to_datetime(df.index, errors="coerce")
+    
+    df = df.sort_index().dropna(how="all")
+    
     if df.empty:
-        st.error("No data available.")
+        st.error("No data available after alignment.")
         return None
 
     st.caption(f"Data shape: {df.shape} | GLI non-NaN: {gli.notna().sum()}")
@@ -176,7 +150,7 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
-# ── Main Execution ──────────────────────────────────────────────────────
+# Main
 start_str = START_DATE.strftime("%Y-%m-%d")
 end_str = datetime.today().strftime("%Y-%m-%d")
 
@@ -186,18 +160,17 @@ FRED_SERIES = {
     "RRPONTSYD": "RRP",
     "ECBASSETSW": "ECB_EUR",
     "JPNASSETS": "BOJ_JPYT",
-    "SNBASSETS": "SNB_CHF",
     "DEXUSEU": "EUR_USD",
     "DEXJPUS": "JPY_USD",
-    "DEXSZUS": "CHF_USD_INV",
-    "DEXUSUK": "GBP_USD",
 }
 
-with st.spinner("Fetching central bank & market data... (first load ~30-60s)"):
+with st.spinner("Fetching data... (first load can take 30-60 seconds)"):
     raw = {}
     for sid, name in FRED_SERIES.items():
         raw[name] = get_fred_series(sid, name, start_str)
 
+    raw["ECB"] = get_ecb_total_assets(start_str)   # redundant safety
+    raw["BOJ"] = get_boj_total_assets(start_str)
     raw["BOE"] = get_boe_total_assets(start_str)
 
     df_raw = pd.DataFrame(raw).sort_index().ffill()
@@ -213,4 +186,4 @@ if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("Current coverage: FED + ECB + BOJ + BOE + SNB. More central banks can be added.")
+st.caption("Current reliable coverage: **FED + ECB + BOJ**. BOE temporarily skipped due to access issue.")
