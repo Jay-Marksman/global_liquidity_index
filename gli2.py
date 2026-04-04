@@ -33,33 +33,49 @@ with st.sidebar:
         st.warning("Enter your FRED API key to continue.")
         st.stop()
 
-RESAMPLE = "W-FRI"
-start_str = START_DATE.strftime("%Y-%m-%d")
-end_str   = datetime.today().strftime("%Y-%m-%d")
+RESAMPLE   = "W-FRI"
+start_str  = START_DATE.strftime("%Y-%m-%d")
+end_str    = datetime.today().strftime("%Y-%m-%d")
 
-# ── Fred client (one instance per key, not cached globally) ────────────────────
-# Store in session_state so cache_data functions can reference it via closure
-# without Streamlit trying to hash the Fred object.
+# ── Fred client ────────────────────────────────────────────────────────────────
 if "fred" not in st.session_state or st.session_state.get("fred_key") != FRED_API_KEY:
     st.session_state.fred     = Fred(api_key=FRED_API_KEY)
     st.session_state.fred_key = FRED_API_KEY
 
 fred: Fred = st.session_state.fred
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Index normalisation ────────────────────────────────────────────────────────
+def to_datetime_index(s: pd.Series) -> pd.Series:
+    """
+    Guarantee a tz-naive DatetimeIndex.
+    st.cache_data round-trips Series through Arrow/Parquet which can silently
+    convert DatetimeIndex → int64 (nanoseconds). Fix it unconditionally here
+    rather than only on cache-miss inside fetch_fred.
+    """
+    idx = s.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        idx = pd.to_datetime(idx, unit="ns", errors="coerce")
+    elif idx.tz is not None:
+        idx = idx.tz_localize(None)
+    s = s.copy()
+    s.index = idx
+    return s
+
+def safe_reindex(source: pd.Series, target: pd.Series) -> pd.Series:
+    """Reindex source onto target's index with ffill, fixing dtypes first."""
+    source = to_datetime_index(source)
+    target = to_datetime_index(target)
+    return source.reindex(target.index, method="ffill")
+
 def resample(s: pd.Series) -> pd.Series:
+    s = to_datetime_index(s)
     return s.resample(RESAMPLE).last().ffill()
 
+# ── FRED fetch ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fred(series_id: str, start: str) -> pd.Series:
-    """Fetch a single FRED series and resample weekly."""
     try:
         s = fred.get_series(series_id, observation_start=start)
-        # FRED occasionally returns an int64 positional index instead of
-        # DatetimeIndex (seen with BOEBSTASGBP and a few others). Force it.
-        if not isinstance(s.index, pd.DatetimeIndex):
-            s.index = pd.to_datetime(s.index)
-        s.index = s.index.tz_localize(None)  # strip tz if present
         return resample(s).rename(series_id)
     except Exception as e:
         st.warning(f"FRED `{series_id}` failed: {e}")
@@ -71,55 +87,41 @@ def fx(fred_id: str) -> pd.Series:
 # ── Central bank fetchers ──────────────────────────────────────────────────────
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_fed(start: str):
-    """FED total assets (WALCL) in USD millions → keep as-is, divide later."""
-    return fetch_fred("WALCL", start)
+def get_fed(start: str) -> pd.Series:
+    return fetch_fred("WALCL", start)           # USD millions
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_tga(start: str):
-    return fetch_fred("WTREGEN", start)
+def get_tga(start: str) -> pd.Series:
+    return fetch_fred("WTREGEN", start)         # USD billions
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_rrp(start: str):
-    return fetch_fred("RRPONTSYD", start)
+def get_rrp(start: str) -> pd.Series:
+    return fetch_fred("RRPONTSYD", start)       # USD billions
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_ecb(start: str) -> pd.Series:
-    """ECB total assets: FRED ECBASSETSW (EUR millions) → USD billions."""
-    ecb_eur = fetch_fred("ECBASSETSW", start)   # EUR millions
-    eur_usd = fx("DEXUSEU")                      # USD per 1 EUR
-    aligned = ecb_eur.reindex(eur_usd.index, method="ffill")
-    return (aligned * eur_usd / 1_000).rename("ECB")  # → USD billions
+    """ECBASSETSW: EUR millions → USD billions."""
+    ecb_eur = fetch_fred("ECBASSETSW", start)
+    eur_usd = fx("DEXUSEU")
+    return (safe_reindex(ecb_eur, eur_usd) * eur_usd / 1_000).rename("ECB")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boj(start: str) -> pd.Series:
-    """BOJ total assets via FRED JPNASSETS (JPY trillions) → USD billions."""
-    # JPNASSETS = JPY trillions; multiply by 1e3 to get billions JPY
-    boj_jpy = fetch_fred("JPNASSETS", start) * 1_000   # JPY billions
+    """JPNASSETS: JPY trillions → USD billions."""
+    boj_jpy_b = fetch_fred("JPNASSETS", start) * 1_000   # JPY trillions → billions
     jpy_per_usd = fx("DEXJPUS")
-    aligned = boj_jpy.reindex(jpy_per_usd.index, method="ffill")
-    return (aligned / jpy_per_usd).rename("BOJ")        # → USD billions
-
-def _ensure_datetime_index(s: pd.Series) -> pd.Series:
-    """Coerce any index to tz-naive DatetimeIndex. Guards against FRED quirks."""
-    if not isinstance(s.index, pd.DatetimeIndex):
-        s = s.copy()
-        s.index = pd.to_datetime(s.index, errors="coerce")
-    if s.index.tz is not None:
-        s.index = s.index.tz_localize(None)
-    return s
+    return (safe_reindex(boj_jpy_b, jpy_per_usd) / jpy_per_usd).rename("BOJ")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """BOE total assets: FRED BOEBSTASGBP (GBP millions) → USD billions."""
-    boe_gbp = _ensure_datetime_index(fetch_fred("BOEBSTASGBP", start))
-    gbp_usd = _ensure_datetime_index(fx("DEXUSUK"))
-    aligned = boe_gbp.reindex(gbp_usd.index, method="ffill")
-    return (aligned * gbp_usd / 1_000).rename("BOE")
+    """BOEBSTASGBP: GBP millions → USD billions."""
+    boe_gbp = fetch_fred("BOEBSTASGBP", start)
+    gbp_usd = fx("DEXUSUK")
+    return (safe_reindex(boe_gbp, gbp_usd) * gbp_usd / 1_000).rename("BOE")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
-    """BOC: try Bank of Canada valet API, fall back to FRED CAALTSASSETS."""
+    """BOC valet API (CAD millions) → USD billions. Falls back to FRED."""
     try:
         url = (
             "https://www.bankofcanada.ca/valet/observations/group/b2_weekly/csv"
@@ -127,7 +129,7 @@ def get_boc(start: str) -> pd.Series:
         )
         df = pd.read_csv(url, skiprows=1)
         df.columns = df.columns.str.strip()
-        date_col = next(c for c in df.columns if "date" in c.lower())
+        date_col  = next(c for c in df.columns if "date" in c.lower())
         asset_col = next(
             (c for c in df.columns
              if "total asset" in c.lower() and "liability" not in c.lower()),
@@ -137,58 +139,52 @@ def get_boc(start: str) -> pd.Series:
             raise ValueError("Total assets column not found in BOC CSV.")
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         df = df.dropna(subset=[date_col]).set_index(date_col)
-        assets_cad_m = pd.to_numeric(
-            df[asset_col].astype(str).str.replace(",", ""), errors="coerce"
-        ).dropna()
-        assets_cad_b = resample(assets_cad_m) / 1_000   # CAD millions → billions
-        cad_per_usd  = fx("DEXCAUS")
-        aligned = assets_cad_b.reindex(cad_per_usd.index, method="ffill")
-        return (aligned / cad_per_usd).rename("BOC")    # → USD billions
+        assets_cad_b = (
+            pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce")
+            .dropna()
+            .pipe(resample)
+            / 1_000                         # CAD millions → billions
+        )
+        cad_per_usd = fx("DEXCAUS")
+        return (safe_reindex(assets_cad_b, cad_per_usd) / cad_per_usd).rename("BOC")
     except Exception as e:
-        st.warning(f"BOC valet API failed ({e}). Falling back to FRED CAALTSASSETS.")
+        st.warning(f"BOC valet failed ({e}). Trying FRED CAALTSASSETS.")
         try:
-            boc_cad_m = fetch_fred("CAALTSASSETS", start)  # CAD millions
+            boc_cad_m   = fetch_fred("CAALTSASSETS", start)
             cad_per_usd = fx("DEXCAUS")
-            aligned = boc_cad_m.reindex(cad_per_usd.index, method="ffill")
-            return (aligned / 1_000 / cad_per_usd).rename("BOC")
+            return (safe_reindex(boc_cad_m, cad_per_usd) / 1_000 / cad_per_usd).rename("BOC")
         except Exception as e2:
-            st.warning(f"BOC FRED fallback also failed: {e2}")
+            st.warning(f"BOC FRED fallback failed: {e2}")
             return pd.Series(dtype=float, name="BOC")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_rba(start: str) -> pd.Series:
-    """RBA total assets: FRED RBATOTASSETS (AUD millions) → USD billions."""
-    rba_aud_m = fetch_fred("RBATOTASSETS", start)  # AUD millions
-    aud_usd   = fx("DEXUSAL")                       # USD per 1 AUD
-    aligned   = rba_aud_m.reindex(aud_usd.index, method="ffill")
-    return (aligned * aud_usd / 1_000).rename("RBA")
+    """RBATOTASSETS: AUD millions → USD billions."""
+    rba_aud_m = fetch_fred("RBATOTASSETS", start)
+    aud_usd   = fx("DEXUSAL")
+    return (safe_reindex(rba_aud_m, aud_usd) * aud_usd / 1_000).rename("RBA")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_snb(start: str) -> pd.Series:
-    """SNB total assets: FRED SNBASSETS (CHF billions) → USD billions."""
-    snb_chf_b  = fetch_fred("SNBASSETS", start)   # CHF billions
+    """SNBASSETS: CHF billions → USD billions."""
+    snb_chf_b   = fetch_fred("SNBASSETS", start)
     chf_per_usd = fx("DEXSZUS")
-    aligned = snb_chf_b.reindex(chf_per_usd.index, method="ffill")
-    return (aligned / chf_per_usd).rename("SNB")
+    return (safe_reindex(snb_chf_b, chf_per_usd) / chf_per_usd).rename("SNB")
 
 # ── GLI assembly ───────────────────────────────────────────────────────────────
-def build_gli(components: dict[str, pd.Series]) -> pd.Series:
-    """
-    GLI = FED(USD B) - TGA - RRP + ECB + BOJ + BOC + RBA + BOE + SNB
-    All inputs should be in USD billions before calling this.
-    """
+def build_gli(components: dict) -> pd.Series:
+    """GLI = FED(USD B) - TGA - RRP + ECB + BOJ + BOC + RBA + BOE + SNB"""
     def get(key) -> pd.Series:
-        return components.get(key, pd.Series(dtype=float))
+        s = components.get(key, pd.Series(dtype=float))
+        return to_datetime_index(s)
 
-    # WALCL is in USD millions; convert to billions here
-    fed = get("FED") * 0.001
+    fed = get("FED") * 0.001               # USD millions → billions
     tga = get("TGA")
     rrp = get("RRP")
 
-    addends = [get(k) for k in ("ECB", "BOJ", "BOC", "RBA", "BOE", "SNB")]
     gli = fed.sub(tga, fill_value=0).sub(rrp, fill_value=0)
-    for s in addends:
-        gli = gli.add(s, fill_value=0)
+    for key in ("ECB", "BOJ", "BOC", "RBA", "BOE", "SNB"):
+        gli = gli.add(get(key), fill_value=0)
 
     return gli.rename("GLI_USD_B")
 
@@ -205,7 +201,6 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame) -> go.Figure | None:
         st.error("No data to plot.")
         return None
 
-    # Guard against zero/NaN in base row before indexing
     base = df.iloc[0].replace(0, np.nan)
     idx  = df.div(base) * 100
 
@@ -249,15 +244,15 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame) -> go.Figure | None:
 with st.status("Loading data...", expanded=True) as status:
     components = {}
     steps = [
-        ("FED assets (WALCL)",    "FED", lambda: get_fed(start_str)),
-        ("TGA (WTREGEN)",         "TGA", lambda: get_tga(start_str)),
-        ("RRP (RRPONTSYD)",       "RRP", lambda: get_rrp(start_str)),
-        ("ECB (ECBASSETSW)",      "ECB", lambda: get_ecb(start_str)),
-        ("BOJ (JPNASSETS)",       "BOJ", lambda: get_boj(start_str)),
-        ("BOE (BOEBSTASGBP)",     "BOE", lambda: get_boe(start_str)),
-        ("BOC",                   "BOC", lambda: get_boc(start_str)),
-        ("RBA (RBATOTASSETS)",    "RBA", lambda: get_rba(start_str)),
-        ("SNB (SNBASSETS)",       "SNB", lambda: get_snb(start_str)),
+        ("FED assets (WALCL)",  "FED", lambda: get_fed(start_str)),
+        ("TGA (WTREGEN)",       "TGA", lambda: get_tga(start_str)),
+        ("RRP (RRPONTSYD)",     "RRP", lambda: get_rrp(start_str)),
+        ("ECB (ECBASSETSW)",    "ECB", lambda: get_ecb(start_str)),
+        ("BOJ (JPNASSETS)",     "BOJ", lambda: get_boj(start_str)),
+        ("BOE (BOEBSTASGBP)",   "BOE", lambda: get_boe(start_str)),
+        ("BOC",                 "BOC", lambda: get_boc(start_str)),
+        ("RBA (RBATOTASSETS)",  "RBA", lambda: get_rba(start_str)),
+        ("SNB (SNBASSETS)",     "SNB", lambda: get_snb(start_str)),
     ]
     for label, key, fn in steps:
         st.write(f"Fetching {label}...")
@@ -275,7 +270,7 @@ fig = plot_gli(gli, market)
 if fig:
     st.plotly_chart(fig, use_container_width=True)
 
-# ── Debug / data table ─────────────────────────────────────────────────────────
+# ── Coverage summary & raw data ────────────────────────────────────────────────
 with st.expander("Coverage summary"):
     summary = {k: f"{v.notna().sum()} weeks" for k, v in components.items()}
     summary["GLI"] = f"{gli.notna().sum()} weeks"
