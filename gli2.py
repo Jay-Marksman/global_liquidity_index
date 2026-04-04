@@ -114,43 +114,38 @@ def get_boj(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """
-    BOE total assets via BIS (Bank for International Settlements) data portal.
-    Dataset CBS: total assets of central banks, monthly, GBP millions.
-    BOE's own database requires a browser session and cannot be scraped.
-    Falls back to FRED UKASSETS (discontinued ~2014) for deep history.
-    """
-    import io, requests
+    """Bank of England weekly total assets - official CSV endpoint"""
     try:
-        # BIS publishes central bank balance sheets via SDMX/CSV
-        # Dataset: WS_CBS, series key: Q.5J.N.A.A.A.A.A1.GBP (BOE total assets, quarterly GBP)
-        # More accessible: use BIS total credit / reserve data CSV
-        # Best available: ECB SDW mirrors BOE data via BSI dataset
-        # Practical best: BIS publishes "Central bank assets" in XLSX, but
-        # the most machine-readable BOE source is their own statistics API
-        # at api.bankofengland.co.uk (separate from the database)
-        url = "https://api.bankofengland.co.uk/series/RPQB55A"
-        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        data = resp.json()
-        # Response: {"Observations": [{"date": "YYYY-MM-DD", "value": 123}, ...]}
-        obs  = data.get("Observations", data.get("observations", []))
-        dates  = pd.to_datetime([o["date"] for o in obs])
-        values = pd.to_numeric([o["value"] for o in obs], errors="coerce")
-        assets_gbp_m = pd.Series(values, index=dates).dropna()
-        assets_gbp_m = resample(assets_gbp_m)
-        gbp_usd = fx("DEXUSUK")
-        return (safe_reindex(assets_gbp_m, gbp_usd) * gbp_usd / 1_000).rename("BOE")
-    except Exception as e:
-        st.warning(f"BOE REST API failed ({e}). Falling back to FRED UKASSETS (ends ~2014).")
-        try:
-            boe_gbp = fetch_fred("UKASSETS", start)   # GBP millions, monthly
-            gbp_usd = fx("DEXUSUK")
-            return (safe_reindex(boe_gbp, gbp_usd) * gbp_usd / 1_000).rename("BOE")
-        except Exception as e2:
-            st.warning(f"BOE FRED fallback also failed: {e2}")
-            return pd.Series(dtype=float, name="BOE")
+        url = (
+            "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?"
+            "Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018"
+            "&TD=31&TM=Dec&TY=2027&FNY=Y&CSVF=TT&html.x=66&html.y=26"
+            "&SeriesCodes=RPWB55A,RPWB56A,RPWB59A,RPWB67A,RPWZ4TJ,RPWZ4TK,RPWZOQ4,"
+            "RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20"
+            "England%20Weekly%20Report&VPD=Y"
+        )
+        df = pd.read_csv(url, skiprows=1, headers={"User-Agent": "Mozilla/5.0"})
+        df.columns = df.columns.str.strip()
 
+        # Dynamically find date and total assets columns
+        date_col = next((c for c in df.columns if "date" in c.lower() or "period" in c.lower()), None)
+        asset_col = next((c for c in df.columns if "total asset" in str(c).lower() and "liability" not in str(c).lower()), None)
+
+        if not date_col or not asset_col:
+            raise ValueError("Could not find date or total assets column")
+
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        assets = pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
+        assets = resample(assets)
+
+        gbp_usd = fx("DEXUSUK")
+        return (safe_reindex(assets, gbp_usd) * gbp_usd / 1000).rename("BOE")
+
+    except Exception as e:
+        st.warning(f"BOE fetch failed: {e} (using zero for now)")
+        return pd.Series(dtype=float, name="BOE")
+        
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
     """
