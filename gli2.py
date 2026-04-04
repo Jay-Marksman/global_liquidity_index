@@ -118,6 +118,9 @@ def get_boj(start: str) -> pd.Series:
 def get_boe(start: str) -> pd.Series:
     """Bank of England weekly total assets - official CSV endpoint"""
     try:
+        import requests
+        import io
+
         url = (
             "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?"
             "Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018"
@@ -126,21 +129,26 @@ def get_boe(start: str) -> pd.Series:
             "RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20"
             "England%20Weekly%20Report&VPD=Y"
         )
-        
-        # Use requests with proper User-Agent to reduce 403 blocks
+
+        # Fetch with proper headers to reduce blocks
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         resp.raise_for_status()
-        
-        # Parse the CSV from the response text
-        df = pd.read_csv(io.StringIO(resp.text), skiprows=1)
+
+        # Safety check: if the response looks like HTML (error page), abort
+        text = resp.text.strip()
+        if text.startswith("<!DOCTYPE") or "<html" in text.lower() or "error" in text.lower():
+            raise ValueError("Received HTML error page instead of CSV")
+
+        # Parse as CSV
+        df = pd.read_csv(io.StringIO(text), skiprows=1)
         df.columns = df.columns.str.strip()
 
-        # Dynamically find columns
+        # Dynamically locate columns
         date_col = next((c for c in df.columns if "date" in c.lower() or "period" in c.lower()), None)
         asset_col = next((c for c in df.columns if "total asset" in str(c).lower() and "liability" not in str(c).lower()), None)
 
         if not date_col or not asset_col:
-            raise ValueError("Could not find date or total assets column")
+            raise ValueError("Could not locate date or total assets column")
 
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         df = df.dropna(subset=[date_col]).set_index(date_col)
