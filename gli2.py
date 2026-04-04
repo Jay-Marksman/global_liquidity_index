@@ -55,6 +55,11 @@ def fetch_fred(series_id: str, start: str) -> pd.Series:
     """Fetch a single FRED series and resample weekly."""
     try:
         s = fred.get_series(series_id, observation_start=start)
+        # FRED occasionally returns an int64 positional index instead of
+        # DatetimeIndex (seen with BOEBSTASGBP and a few others). Force it.
+        if not isinstance(s.index, pd.DatetimeIndex):
+            s.index = pd.to_datetime(s.index)
+        s.index = s.index.tz_localize(None)  # strip tz if present
         return resample(s).rename(series_id)
     except Exception as e:
         st.warning(f"FRED `{series_id}` failed: {e}")
