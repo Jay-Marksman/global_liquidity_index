@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 from fredapi import Fred
 from datetime import datetime
 import numpy as np
+import requests   # ← Fixed: required for BOC and RBA
 
 st.set_page_config(page_title="Global Liquidity Index vs SPY & BTC", layout="wide")
 st.title("🌍 Global Liquidity Index vs SPY & BTC")
@@ -25,7 +26,7 @@ RESAMPLE = "W-FRI"
 start_str = START_DATE.strftime("%Y-%m-%d")
 end_str = datetime.today().strftime("%Y-%m-%d")
 
-# ── Fred client (session state for stability) ──────────────────────────────────
+# ── Fred client ────────────────────────────────────────────────────────────────
 if "fred" not in st.session_state or st.session_state.get("fred_key") != FRED_API_KEY:
     st.session_state.fred = Fred(api_key=FRED_API_KEY)
     st.session_state.fred_key = FRED_API_KEY
@@ -55,7 +56,7 @@ def fetch_fred(series_id: str, start: str) -> pd.Series:
 def fx(fred_id: str) -> pd.Series:
     return fetch_fred(fred_id, start_str)
 
-# ── Central Bank Fetchers (stable sources only) ────────────────────────────────
+# ── Central Bank Fetchers ──────────────────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_fed(start: str) -> pd.Series:
     return fetch_fred("WALCL", start)
@@ -76,14 +77,14 @@ def get_ecb(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boj(start: str) -> pd.Series:
-    """JPNASSETS = 100 million JPY → correct scaling to USD billions"""
-    boj_100m_jpy = fetch_fred("JPNASSETS", start)
+    """Fixed scaling: JPNASSETS in 100 million JPY"""
+    boj = fetch_fred("JPNASSETS", start)
     jpy_usd = fx("DEXJPUS")
-    return (safe_reindex(boj_100m_jpy, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
+    return (safe_reindex(boj, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """Official BOE weekly CSV (stable endpoint)"""
+    """BOE weekly report CSV (most reliable public endpoint)"""
     try:
         url = "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018&TD=31&TM=Dec&TY=2027&FNY=Y&CSVF=TT&html.x=66&html.y=26&SeriesCodes=RPWB55A,RPWB56A,RPWB59A,RPWB67A,RPWZ4TJ,RPWZ4TK,RPWZOQ4,RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20England%20Weekly%20Report&VPD=Y"
         df = pd.read_csv(url, skiprows=1)
@@ -109,7 +110,7 @@ def get_boc(start: str) -> pd.Series:
         dates = pd.to_datetime([o["d"] for o in obs])
         values = pd.to_numeric([o["V36610"]["v"] for o in obs], errors="coerce")
         assets = pd.Series(values, index=dates).dropna()
-        assets = resample(assets) / 1000  # millions → billions CAD
+        assets = resample(assets) / 1000   # CAD millions → billions
         cad_usd = fx("DEXCAUS")
         return (safe_reindex(assets, cad_usd) / cad_usd).rename("BOC")
     except Exception as e:
@@ -125,7 +126,7 @@ def get_rba(start: str) -> pd.Series:
         df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
         df = df.dropna(subset=["date"]).set_index("date")
         assets = pd.to_numeric(df.iloc[:, 13], errors="coerce").dropna()  # Total assets column
-        assets = resample(assets) / 1000  # millions → billions AUD
+        assets = resample(assets) / 1000   # AUD millions → billions
         aud_usd = fx("DEXUSAL")
         return (safe_reindex(assets, aud_usd) * aud_usd).rename("RBA")
     except Exception as e:
@@ -135,14 +136,14 @@ def get_rba(start: str) -> pd.Series:
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_snb(start: str) -> pd.Series:
     try:
-        s = fetch_fred("SNBFORCURPOS", start)  # reliable proxy
+        s = fetch_fred("SNBFORCURPOS", start)
         chf_usd = fx("DEXSZUS")
         return (safe_reindex(s, chf_usd) / chf_usd / 1000).rename("SNB")
     except Exception as e:
         st.warning(f"SNB: {e}")
         return pd.Series(dtype=float, name="SNB")
 
-# ── Build GLI ──────────────────────────────────────────────────────────────────
+# ── Build GLI (robust) ─────────────────────────────────────────────────────────
 def build_gli(components: dict) -> pd.Series:
     def get(key):
         s = components.get(key, pd.Series(dtype=float))
@@ -203,8 +204,8 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
-# ── Main Execution ─────────────────────────────────────────────────────────────
-with st.status("Loading data... (this may take 40–70 seconds first time)", expanded=True) as status:
+# ── Main ───────────────────────────────────────────────────────────────────────
+with st.status("Loading data... (first load can take 40–80 seconds)", expanded=True) as status:
     components = {}
     steps = [
         ("FED assets", "FED", lambda: get_fed(start_str)),
@@ -229,7 +230,7 @@ with st.status("Loading data... (this may take 40–70 seconds first time)", exp
 
     status.update(label="✅ Done", state="complete", expanded=False)
 
-# Latest GLI metric (always visible)
+# Latest GLI metric (very useful)
 latest_gli = gli.iloc[-1] if not gli.empty else np.nan
 st.metric("Latest Global Liquidity Index", f"{latest_gli:,.0f} billion USD")
 
@@ -237,7 +238,7 @@ fig = plot_gli(gli, market)
 if fig:
     st.plotly_chart(fig, use_container_width=True)
 
-# ── Coverage & Raw Data ────────────────────────────────────────────────────────
+# Coverage summary
 with st.expander("Coverage summary"):
     summary = {k: f"{v.notna().sum()} weeks" for k, v in components.items()}
     summary["GLI"] = f"{gli.notna().sum()} weeks"
@@ -247,4 +248,4 @@ if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("Coverage: FED · ECB · BOJ · BOC · RBA · BOE · SNB | Next additions possible: PBC, RBI, etc.")
+st.caption("Current coverage: FED · ECB · BOJ · BOC · RBA · BOE · SNB | Next: PBC, RBI, etc.")
