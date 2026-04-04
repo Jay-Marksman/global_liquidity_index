@@ -114,62 +114,145 @@ def get_boj(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """BOEBSTASGBP: GBP millions → USD billions."""
-    boe_gbp = fetch_fred("BOEBSTASGBP", start)
-    gbp_usd = fx("DEXUSUK")
-    return (safe_reindex(boe_gbp, gbp_usd) * gbp_usd / 1_000).rename("BOE")
+    """
+    BOE total assets from the Bank of England's own API.
+    Series RPQB53A = total assets of the Bank Return, GBP millions, monthly.
+    Falls back to the discontinued FRED series UKASSETS if the API fails.
+    """
+    try:
+        url = (
+            "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp"
+            "?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG"
+            "&FD=1&FM=Jan&FY=2014&TD=1&TM=Jan&TY=2030"
+            "&FNY=Y&CSVF=TT&html.x=66&html.y=26"
+            "&SeriesCodes=RPQB53A&UsingCodes=Y"
+        )
+        import io
+        import requests
+        resp = requests.get(url, timeout=20,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = df.columns.str.strip()
+        date_col  = df.columns[0]
+        value_col = df.columns[1]
+        df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        assets_gbp_m = pd.to_numeric(df[value_col], errors="coerce").dropna()
+        assets_gbp_m = resample(assets_gbp_m)
+        gbp_usd = fx("DEXUSUK")
+        return (safe_reindex(assets_gbp_m, gbp_usd) * gbp_usd / 1_000).rename("BOE")
+    except Exception as e:
+        st.warning(f"BOE API failed ({e}). Falling back to FRED UKASSETS (discontinued ~2014).")
+        try:
+            # UKASSETS: GBP millions, monthly, ends ~2014 — useful for history only
+            boe_gbp = fetch_fred("UKASSETS", start)
+            gbp_usd = fx("DEXUSUK")
+            return (safe_reindex(boe_gbp, gbp_usd) * gbp_usd / 1_000).rename("BOE")
+        except Exception as e2:
+            st.warning(f"BOE FRED fallback also failed: {e2}")
+            return pd.Series(dtype=float, name="BOE")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
-    """BOC valet API (CAD millions) → USD billions. Falls back to FRED."""
+    """
+    Bank of Canada total assets via the Valet API (JSON, more reliable than CSV).
+    Series: B2_TOTA = total assets, CAD millions, weekly.
+    """
     try:
+        import requests
         url = (
-            "https://www.bankofcanada.ca/valet/observations/group/b2_weekly/csv"
-            "?start_date=" + start
+            f"https://www.bankofcanada.ca/valet/observations/B2_TOTA/json"
+            f"?start_date={start}"
         )
-        df = pd.read_csv(url, skiprows=1)
-        df.columns = df.columns.str.strip()
-        date_col  = next(c for c in df.columns if "date" in c.lower())
-        asset_col = next(
-            (c for c in df.columns
-             if "total asset" in c.lower() and "liability" not in c.lower()),
-            None
-        )
-        if not asset_col:
-            raise ValueError("Total assets column not found in BOC CSV.")
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col]).set_index(date_col)
-        assets_cad_b = (
-            pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce")
-            .dropna()
-            .pipe(resample)
-            / 1_000                         # CAD millions → billions
-        )
-        cad_per_usd = fx("DEXCAUS")
+        data = requests.get(url, timeout=20).json()
+        obs  = data["observations"]
+        dates  = pd.to_datetime([o["d"] for o in obs])
+        values = pd.to_numeric([o["B2_TOTA"]["v"] for o in obs], errors="coerce")
+        assets_cad_m = pd.Series(values, index=dates).dropna()
+        assets_cad_b = resample(assets_cad_m) / 1_000   # CAD millions → billions
+        cad_per_usd  = fx("DEXCAUS")
         return (safe_reindex(assets_cad_b, cad_per_usd) / cad_per_usd).rename("BOC")
     except Exception as e:
-        st.warning(f"BOC valet failed ({e}). Trying FRED CAALTSASSETS.")
-        try:
-            boc_cad_m   = fetch_fred("CAALTSASSETS", start)
-            cad_per_usd = fx("DEXCAUS")
-            return (safe_reindex(boc_cad_m, cad_per_usd) / 1_000 / cad_per_usd).rename("BOC")
-        except Exception as e2:
-            st.warning(f"BOC FRED fallback failed: {e2}")
-            return pd.Series(dtype=float, name="BOC")
+        st.warning(f"BOC Valet API failed: {e}")
+        return pd.Series(dtype=float, name="BOC")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_rba(start: str) -> pd.Series:
-    """RBATOTASSETS: AUD millions → USD billions."""
-    rba_aud_m = fetch_fred("RBATOTASSETS", start)
-    aud_usd   = fx("DEXUSAL")
-    return (safe_reindex(rba_aud_m, aud_usd) * aud_usd / 1_000).rename("RBA")
+    """
+    RBA total assets from RBA's own statistics table A1 (CSV).
+    Column 'Assets; Total assets' in AUD millions, weekly.
+    """
+    try:
+        url = "https://www.rba.gov.au/statistics/tables/csv/a1-data.csv"
+        # Skip the multi-row header block; find the real header row dynamically
+        raw = pd.read_csv(url, header=None, dtype=str)
+        # The date column header is usually 'Series ID' or blank; find the row
+        # where the first cell looks like a date (YYYY-MM-DD or DD-Mon-YYYY)
+        header_row = next(
+            i for i, row in raw.iterrows()
+            if str(row.iloc[0]).strip().lower() in ("series id", "date", "")
+               and pd.to_datetime(str(raw.iloc[i+1, 0]), errors="coerce") is not pd.NaT
+        )
+        df = pd.read_csv(url, skiprows=header_row + 1, header=0, dtype=str)
+        df.columns = df.columns.str.strip()
+        date_col = df.columns[0]
+        # Find 'Total assets' column — RBA labels it consistently
+        asset_col = next(
+            (c for c in df.columns if "total assets" in c.lower()), None
+        )
+        if not asset_col:
+            raise ValueError(f"'Total assets' column not found. Columns: {list(df.columns)}")
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        assets_aud_m = pd.to_numeric(df[asset_col].str.replace(",", ""), errors="coerce").dropna()
+        assets_aud_m = resample(assets_aud_m)
+        aud_usd = fx("DEXUSAL")
+        return (safe_reindex(assets_aud_m, aud_usd) * aud_usd / 1_000).rename("RBA")
+    except Exception as e:
+        st.warning(f"RBA fetch failed: {e}")
+        return pd.Series(dtype=float, name="RBA")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_snb(start: str) -> pd.Series:
-    """SNBASSETS: CHF billions → USD billions."""
-    snb_chf_b   = fetch_fred("SNBASSETS", start)
-    chf_per_usd = fx("DEXSZUS")
-    return (safe_reindex(snb_chf_b, chf_per_usd) / chf_per_usd).rename("SNB")
+    """
+    SNB total assets from SNB's own data portal (JSON API).
+    Dataset: snb_id=BSSNB, position ATASSET (total assets, CHF millions, monthly).
+    Falls back to SNBFORCURPOS (foreign currency investments ~95% of SNB assets)
+    as a close proxy if the primary fetch fails.
+    """
+    try:
+        import requests
+        # SNB open data API — returns monthly total assets in CHF millions
+        url = (
+            "https://data.snb.ch/api/cube/snbbipo/data/json"
+            "?fromDate=" + start[:7]   # YYYY-MM
+        )
+        data   = requests.get(url, timeout=20).json()
+        series = {
+            item["date"]: item["value"]
+            for item in data["data"]
+            if item.get("position") == "ATASSET" and item.get("currency") == "CHF"
+        }
+        if not series:
+            raise ValueError("ATASSET position not found in SNB JSON response.")
+        snb_chf_m = pd.Series(series).rename_axis("date")
+        snb_chf_m.index = pd.to_datetime(snb_chf_m.index)
+        snb_chf_m = pd.to_numeric(snb_chf_m, errors="coerce").dropna()
+        snb_chf_b = resample(snb_chf_m) / 1_000   # CHF millions → billions
+        chf_per_usd = fx("DEXSZUS")
+        return (safe_reindex(snb_chf_b, chf_per_usd) / chf_per_usd).rename("SNB")
+    except Exception as e:
+        st.warning(f"SNB primary API failed ({e}). Falling back to FRED SNBFORCURPOS proxy.")
+        try:
+            # SNBFORCURPOS = foreign currency investments, CHF millions
+            # Covers ~95% of SNB total assets — good enough proxy
+            snb_chf_m   = fetch_fred("SNBFORCURPOS", start)
+            chf_per_usd = fx("DEXSZUS")
+            return (safe_reindex(snb_chf_m, chf_per_usd) / chf_per_usd / 1_000).rename("SNB")
+        except Exception as e2:
+            st.warning(f"SNB FRED fallback also failed: {e2}")
+            return pd.Series(dtype=float, name="SNB")
 
 # ── GLI assembly ───────────────────────────────────────────────────────────────
 def build_gli(components: dict) -> pd.Series:
