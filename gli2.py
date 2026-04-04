@@ -10,7 +10,7 @@ import requests
 
 st.set_page_config(page_title="Global Liquidity Index vs SPY & BTC", layout="wide")
 st.title("🌍 Global Liquidity Index vs SPY & BTC")
-st.markdown("**GLI** = FED − TGA − RRP + ECB + BOJ + BOC + RBA + SNB (BOE temporarily skipped)")
+st.markdown("**GLI** = FED − TGA − RRP + ECB + BOJ + BOC + RBA + SNB (BOE skipped)")
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -77,15 +77,14 @@ def get_ecb(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boj(start: str) -> pd.Series:
-    """Correct scaling: JPNASSETS = 100 million Yen"""
+    """JPNASSETS unit = 100 million Yen"""
     boj = fetch_fred("JPNASSETS", start)
     jpy_usd = fx("DEXJPUS")
     return (safe_reindex(boj, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """BOE disabled due to consistent 403 Forbidden errors"""
-    st.info("BOE data temporarily skipped (access restricted by Bank of England)")
+    st.info("BOE data skipped (access restricted by Bank of England)")
     return pd.Series(dtype=float, name="BOE")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -130,7 +129,7 @@ def get_snb(start: str) -> pd.Series:
         st.warning(f"SNB: {e}")
         return pd.Series(dtype=float, name="SNB")
 
-# ── Build GLI ──────────────────────────────────────────────────────────────────
+# ── Build GLI (extra robust) ───────────────────────────────────────────────────
 def build_gli(components: dict) -> pd.Series:
     def get(key):
         s = components.get(key, pd.Series(dtype=float))
@@ -190,19 +189,19 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
-# ── Main Execution ─────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 with st.status("Loading data... (first load can take 40–80 seconds)", expanded=True) as status:
     components = {}
     steps = [
         ("FED assets", "FED", lambda: get_fed(start_str)),
-        ("TGA",        "TGA", lambda: get_tga(start_str)),
-        ("RRP",        "RRP", lambda: get_rrp(start_str)),
-        ("ECB",        "ECB", lambda: get_ecb(start_str)),
-        ("BOJ",        "BOJ", lambda: get_boj(start_str)),
-        ("BOE",        "BOE", lambda: get_boe(start_str)),
-        ("BOC",        "BOC", lambda: get_boc(start_str)),
-        ("RBA",        "RBA", lambda: get_rba(start_str)),
-        ("SNB",        "SNB", lambda: get_snb(start_str)),
+        ("TGA", "TGA", lambda: get_tga(start_str)),
+        ("RRP", "RRP", lambda: get_rrp(start_str)),
+        ("ECB", "ECB", lambda: get_ecb(start_str)),
+        ("BOJ", "BOJ", lambda: get_boj(start_str)),
+        ("BOE", "BOE", lambda: get_boe(start_str)),
+        ("BOC", "BOC", lambda: get_boc(start_str)),
+        ("RBA", "RBA", lambda: get_rba(start_str)),
+        ("SNB", "SNB", lambda: get_snb(start_str)),
     ]
     for label, key, fn in steps:
         st.write(f"Fetching {label}...")
@@ -216,13 +215,13 @@ with st.status("Loading data... (first load can take 40–80 seconds)", expanded
 
     status.update(label="✅ Done", state="complete", expanded=False)
 
-# Latest GLI
+# Latest GLI metric
 latest_gli = gli.iloc[-1] if not gli.empty else np.nan
 st.metric("Latest Global Liquidity Index", f"{latest_gli:,.0f} billion USD")
 
 fig = plot_gli(gli, market)
 if fig:
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")   # Fixed deprecation warning
 
 with st.expander("Coverage summary"):
     summary = {k: f"{v.notna().sum()} weeks" for k, v in components.items()}
@@ -233,4 +232,4 @@ if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("BOE is currently skipped due to access restrictions. Core coverage: FED + ECB + BOJ + BOC + RBA + SNB")
+st.caption("BOE skipped due to access restrictions. Core coverage: FED + ECB + BOJ + BOC + RBA + SNB")
