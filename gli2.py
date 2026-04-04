@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import io 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from fredapi import Fred
@@ -124,10 +125,16 @@ def get_boe(start: str) -> pd.Series:
             "RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20"
             "England%20Weekly%20Report&VPD=Y"
         )
-        df = pd.read_csv(url, skiprows=1, header={"User-Agent": "Mozilla/5.0"})
+        
+        # Use requests with proper User-Agent to reduce 403 blocks
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        resp.raise_for_status()
+        
+        # Parse the CSV from the response text
+        df = pd.read_csv(io.StringIO(resp.text), skiprows=1)
         df.columns = df.columns.str.strip()
 
-        # Dynamically find date and total assets columns
+        # Dynamically find columns
         date_col = next((c for c in df.columns if "date" in c.lower() or "period" in c.lower()), None)
         asset_col = next((c for c in df.columns if "total asset" in str(c).lower() and "liability" not in str(c).lower()), None)
 
