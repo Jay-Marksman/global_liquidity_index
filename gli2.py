@@ -100,11 +100,20 @@ def get_boj(start: str) -> pd.Series:
     aligned = boj_jpy.reindex(jpy_per_usd.index, method="ffill")
     return (aligned / jpy_per_usd).rename("BOJ")        # → USD billions
 
+def _ensure_datetime_index(s: pd.Series) -> pd.Series:
+    """Coerce any index to tz-naive DatetimeIndex. Guards against FRED quirks."""
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s = s.copy()
+        s.index = pd.to_datetime(s.index, errors="coerce")
+    if s.index.tz is not None:
+        s.index = s.index.tz_localize(None)
+    return s
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
     """BOE total assets: FRED BOEBSTASGBP (GBP millions) → USD billions."""
-    boe_gbp = fetch_fred("BOEBSTASGBP", start)  # GBP millions
-    gbp_usd = fx("DEXUSUK")                      # USD per 1 GBP
+    boe_gbp = _ensure_datetime_index(fetch_fred("BOEBSTASGBP", start))
+    gbp_usd = _ensure_datetime_index(fx("DEXUSUK"))
     aligned = boe_gbp.reindex(gbp_usd.index, method="ffill")
     return (aligned * gbp_usd / 1_000).rename("BOE")
 
