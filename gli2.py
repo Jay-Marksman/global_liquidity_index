@@ -62,7 +62,7 @@ def get_ecb_total_assets(start: str):
 @st.cache_data(ttl=86400)
 def get_boj_total_assets(start: str):
     try:
-        # Primary: BOJ official CSV
+        # Primary BOJ CSV (most reliable)
         url = "https://www.stat-search.boj.or.jp/ssi/mtshtml/bs01_m_1_en.csv"
         df = pd.read_csv(url, skiprows=4, encoding="shift_jis")
         df.columns = df.columns.str.strip()
@@ -78,7 +78,8 @@ def get_boj_total_assets(start: str):
         return df_aligned.rename("BOJ")
     except Exception:
         try:
-            s = get_fred_series("JPNASSETS", "BOJ_JPYT", start) * 0.1   # Correct scaling
+            # FRED fallback
+            s = get_fred_series("JPNASSETS", "BOJ_JPYT", start) * 0.1   # Correct scaling: 100 million Yen
             jpy_usd = get_fx("DEXJPUS", start)
             return (s.reindex(jpy_usd.index, method="ffill") / jpy_usd).rename("BOJ")
         except Exception as e:
@@ -206,7 +207,7 @@ FRED_SERIES = {
     "DEXSZUS": "CHF_USD_INV",
 }
 
-with st.spinner("Fetching data... (first run can take 30-70 seconds)"):
+with st.spinner("Fetching data... (first run can take 40-80 seconds)"):
     raw = {}
     for sid, name in FRED_SERIES.items():
         raw[name] = get_fred_series(sid, name, start_str)
@@ -224,15 +225,15 @@ with st.spinner("Fetching data... (first run can take 30-70 seconds)"):
     fig = plot_gli(gli, market)
 
 if fig:
-    st.plotly_chart(fig, width="stretch")   # Fixed deprecation warning
-
-if st.checkbox("Show raw data"):
-    combined = pd.concat([gli, market], axis=1).dropna(how="all")
-    st.dataframe(combined.style.format("{:,.2f}"))
+    st.plotly_chart(fig, width="stretch")
 
 # Latest GLI metric
 latest = gli.iloc[-1] if not gli.empty else 0
 st.metric("Latest Global Liquidity Index", f"{latest:,.0f} billion USD")
 
+if st.checkbox("Show raw data"):
+    combined = pd.concat([gli, market], axis=1).dropna(how="all")
+    st.dataframe(combined.style.format("{:,.2f}"))
+
 st.caption("""Current coverage: FED + ECB + BOJ + BOC + RBA + SNB  
-BOE skipped due to access issues. More banks (PBC, RBI, etc.) can be added later.""")
+BOE skipped due to access issues. The GLI should now be positive again.""")
