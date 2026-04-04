@@ -10,29 +10,29 @@ import requests
 
 st.set_page_config(page_title="Global Liquidity Index vs SPY & BTC", layout="wide")
 st.title("🌍 Global Liquidity Index vs SPY & BTC")
-st.markdown("**GLI** = FED − TGA − RRP + ECB + BOJ + BOC + RBA + BOE + SNB")
+st.markdown("**GLI** = FED − TGA − RRP + ECB + BOJ + BOC + RBA + SNB (BOE skipped due to access issues)")
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# Sidebar
 with st.sidebar:
     st.header("Configuration")
     FRED_API_KEY = st.text_input("FRED API Key", type="password",
                                  help="Free key at https://fred.stlouisfed.org/docs/api/api_key.html")
     START_DATE = st.date_input("Start Date", value=datetime(2015, 1, 1))
     if not FRED_API_KEY:
-        st.warning("Enter your FRED API key to continue.")
+        st.warning("Enter your FRED API key.")
         st.stop()
 
 RESAMPLE = "W-FRI"
 start_str = START_DATE.strftime("%Y-%m-%d")
 end_str = datetime.today().strftime("%Y-%m-%d")
 
-# ── Fred client ────────────────────────────────────────────────────────────────
+# Fred client
 if "fred" not in st.session_state or st.session_state.get("fred_key") != FRED_API_KEY:
     st.session_state.fred = Fred(api_key=FRED_API_KEY)
     st.session_state.fred_key = FRED_API_KEY
-fred: Fred = st.session_state.fred
+fred = st.session_state.fred
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# Helpers
 def resample(s: pd.Series) -> pd.Series:
     if not isinstance(s.index, pd.DatetimeIndex):
         s.index = pd.to_datetime(s.index, errors="coerce")
@@ -43,7 +43,7 @@ def safe_reindex(source: pd.Series, target: pd.Series) -> pd.Series:
     target = resample(target)
     return source.reindex(target.index, method="ffill")
 
-# ── FRED fetch ─────────────────────────────────────────────────────────────────
+# FRED fetch
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fred(series_id: str, start: str) -> pd.Series:
     try:
@@ -56,18 +56,13 @@ def fetch_fred(series_id: str, start: str) -> pd.Series:
 def fx(fred_id: str) -> pd.Series:
     return fetch_fred(fred_id, start_str)
 
-# ── Central Bank Fetchers ──────────────────────────────────────────────────────
+# Central bank fetchers
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_fed(start: str) -> pd.Series:
-    return fetch_fred("WALCL", start)
-
+def get_fed(start: str) -> pd.Series: return fetch_fred("WALCL", start)
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_tga(start: str) -> pd.Series:
-    return fetch_fred("WTREGEN", start)
-
+def get_tga(start: str) -> pd.Series: return fetch_fred("WTREGEN", start)
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_rrp(start: str) -> pd.Series:
-    return fetch_fred("RRPONTSYD", start)
+def get_rrp(start: str) -> pd.Series: return fetch_fred("RRPONTSYD", start)
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_ecb(start: str) -> pd.Series:
@@ -77,16 +72,10 @@ def get_ecb(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boj(start: str) -> pd.Series:
-    """Correct scaling: JPNASSETS unit = 100 million JPY"""
+    """Correct: JPNASSETS = 100 million Yen"""
     boj = fetch_fred("JPNASSETS", start)
     jpy_usd = fx("DEXJPUS")
     return (safe_reindex(boj, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_boe(start: str) -> pd.Series:
-    """BOE temporarily disabled due to 403. Can be re-enabled with alternative source."""
-    st.info("BOE data temporarily skipped (access restricted).")
-    return pd.Series(dtype=float, name="BOE")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
@@ -95,7 +84,7 @@ def get_boc(start: str) -> pd.Series:
         data = requests.get(url, timeout=30).json()
         obs = data["observations"]
         dates = pd.to_datetime([o["d"] for o in obs])
-        values = pd.to_numeric([o["V36610"]["v"] for o in obs], errors="coerce")
+        values = pd.to_numeric([o.get("V36610", {}).get("v", 0) for o in obs], errors="coerce")
         assets = pd.Series(values, index=dates).dropna()
         assets = resample(assets) / 1000
         cad_usd = fx("DEXCAUS")
@@ -112,7 +101,7 @@ def get_rba(start: str) -> pd.Series:
         df.columns = ["date"] + [f"col{i}" for i in range(1, len(df.columns))]
         df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
         df = df.dropna(subset=["date"]).set_index("date")
-        assets = pd.to_numeric(df.iloc[:, 13], errors="coerce").dropna()
+        assets = pd.to_numeric(df.iloc[:, 13], errors="coerce").dropna()  # Total assets
         assets = resample(assets) / 1000
         aud_usd = fx("DEXUSAL")
         return (safe_reindex(assets, aud_usd) * aud_usd).rename("RBA")
@@ -130,7 +119,7 @@ def get_snb(start: str) -> pd.Series:
         st.warning(f"SNB: {e}")
         return pd.Series(dtype=float, name="SNB")
 
-# ── Build GLI (robust, prevents negative artifacts) ────────────────────────────
+# GLI (extra safe)
 def build_gli(components: dict) -> pd.Series:
     def get(key):
         s = components.get(key, pd.Series(dtype=float))
@@ -141,18 +130,18 @@ def build_gli(components: dict) -> pd.Series:
     rrp = get("RRP")
 
     gli = fed.sub(tga, fill_value=0).sub(rrp, fill_value=0)
-    for key in ("ECB", "BOJ", "BOC", "RBA", "BOE", "SNB"):
+    for key in ("ECB", "BOJ", "BOC", "RBA", "SNB"):
         gli = gli.add(get(key), fill_value=0)
 
     return gli.rename("GLI_USD_B")
 
-# ── Market data ────────────────────────────────────────────────────────────────
+# Market
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market(start: str, end: str):
     raw = yf.download(["SPY", "BTC-USD"], start=start, end=end, progress=False)
     return raw["Close"].resample(RESAMPLE).last().ffill()
 
-# ── Plot ───────────────────────────────────────────────────────────────────────
+# Plot
 def plot_gli(gli: pd.Series, market: pd.DataFrame):
     df = pd.concat([gli, market], axis=1).sort_index().dropna(how="all")
     if df.empty:
@@ -163,8 +152,7 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     idx = df.div(base) * 100
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28],
-                        vertical_spacing=0.04,
-                        subplot_titles=("Indexed performance (start = 100)", "GLI (USD trillions)"))
+                        subplot_titles=("Indexed (start=100)", "GLI (USD Trillions)"))
 
     colors = {"GLI_USD_B": "#3266ad", "SPY": "#1D9E75", "BTC-USD": "#D85A30"}
     names = {"GLI_USD_B": "Global Liquidity Index", "SPY": "SPY", "BTC-USD": "BTC/USD"}
@@ -178,7 +166,7 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
 
     if "GLI_USD_B" in df.columns and not df["GLI_USD_B"].isna().all():
         fig.add_trace(go.Scatter(x=df.index, y=(df["GLI_USD_B"]/1000).round(2),
-                                 name="GLI (raw)", mode="lines",
+                                 name="GLI raw", mode="lines",
                                  line=dict(color="#3266ad", width=1.5), showlegend=False),
                       row=2, col=1)
 
@@ -191,11 +179,11 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
-# ── Main Execution ─────────────────────────────────────────────────────────────
-with st.status("Loading data... (first load can take 40–80 seconds)", expanded=True) as status:
+# Main
+with st.status("Loading data... (first load ~40-80s)", expanded=True) as status:
     components = {}
     steps = [
-        ("FED assets", "FED", lambda: get_fed(start_str)),
+        ("FED", "FED", lambda: get_fed(start_str)),
         ("TGA", "TGA", lambda: get_tga(start_str)),
         ("RRP", "RRP", lambda: get_rrp(start_str)),
         ("ECB", "ECB", lambda: get_ecb(start_str)),
@@ -217,22 +205,21 @@ with st.status("Loading data... (first load can take 40–80 seconds)", expanded
 
     status.update(label="✅ Done", state="complete", expanded=False)
 
-# Latest GLI metric (always visible)
-latest_gli = gli.iloc[-1] if not gli.empty else np.nan
-st.metric("Latest Global Liquidity Index", f"{latest_gli:,.0f} billion USD")
+# Latest value
+latest = gli.iloc[-1] if not gli.empty else np.nan
+st.metric("Latest Global Liquidity Index", f"{latest:,.0f} billion USD")
 
 fig = plot_gli(gli, market)
 if fig:
     st.plotly_chart(fig, use_container_width=True)
 
-# Coverage summary
 with st.expander("Coverage summary"):
     summary = {k: f"{v.notna().sum()} weeks" for k, v in components.items()}
     summary["GLI"] = f"{gli.notna().sum()} weeks"
-    st.table(pd.Series(summary, name="Non-null observations"))
+    st.table(pd.Series(summary, name="Non-null weeks"))
 
 if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("Coverage: FED · ECB · BOJ · BOC · RBA · SNB (BOE temporarily skipped due to access restriction)")
+st.caption("BOE currently skipped due to access restrictions. Core coverage: FED + ECB + BOJ + BOC + RBA + SNB")
