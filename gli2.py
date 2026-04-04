@@ -124,7 +124,7 @@ def get_boe(start: str) -> pd.Series:
             "RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20"
             "England%20Weekly%20Report&VPD=Y"
         )
-        df = pd.read_csv(url, skiprows=1, headers={"User-Agent": "Mozilla/5.0"})
+        df = pd.read_csv(url, skiprows=1, header={"User-Agent": "Mozilla/5.0"})
         df.columns = df.columns.str.strip()
 
         # Dynamically find date and total assets columns
