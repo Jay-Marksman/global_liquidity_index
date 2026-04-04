@@ -115,38 +115,46 @@ def get_boj(start: str) -> pd.Series:
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
     """
-    BOE total assets from the Bank of England's own API.
-    Series RPQB53A = total assets of the Bank Return, GBP millions, monthly.
-    Falls back to the discontinued FRED series UKASSETS if the API fails.
+    BOE: FRED ECBASSETSW sister series doesn't exist for BOE, so we use the
+    BOE's Interactive Database CSV export for series RPQB55A (total assets,
+    GBP millions, weekly). The URL below is the direct CSV download link.
+    Falls back to FRED UKASSETS (discontinued 2014) for early history.
     """
+    import io, requests
     try:
+        # RPQB55A = Bank of England total assets (Bank Return), GBP millions, weekly
         url = (
             "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp"
             "?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG"
-            "&FD=1&FM=Jan&FY=2014&TD=1&TM=Jan&TY=2030"
+            "&FD=1&FM=Jan&FY=2015&TD=31&TM=Dec&TY=2030"
             "&FNY=Y&CSVF=TT&html.x=66&html.y=26"
-            "&SeriesCodes=RPQB53A&UsingCodes=Y"
+            "&SeriesCodes=RPQB55A&UsingCodes=Y"
         )
-        import io
-        import requests
-        resp = requests.get(url, timeout=20,
-                            headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        df.columns = df.columns.str.strip()
-        date_col  = df.columns[0]
-        value_col = df.columns[1]
-        df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
-        df = df.dropna(subset=[date_col]).set_index(date_col)
-        assets_gbp_m = pd.to_numeric(df[value_col], errors="coerce").dropna()
+        # BOE CSV: first row = title, second row = units, third row = date header
+        # Use comment='#' and skip metadata rows by finding where dates start
+        lines = resp.text.strip().splitlines()
+        # Find first line where col 0 parses as a date
+        data_start = next(
+            i for i, ln in enumerate(lines)
+            if pd.to_datetime(ln.split(",")[0].strip(), dayfirst=True, errors="coerce")
+            is not pd.NaT
+        )
+        df = pd.read_csv(
+            io.StringIO("\n".join(lines[data_start:])),
+            header=None, names=["date", "value"]
+        )
+        df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+        df = df.dropna(subset=["date"]).set_index("date")
+        assets_gbp_m = pd.to_numeric(df["value"], errors="coerce").dropna()
         assets_gbp_m = resample(assets_gbp_m)
         gbp_usd = fx("DEXUSUK")
         return (safe_reindex(assets_gbp_m, gbp_usd) * gbp_usd / 1_000).rename("BOE")
     except Exception as e:
-        st.warning(f"BOE API failed ({e}). Falling back to FRED UKASSETS (discontinued ~2014).")
+        st.warning(f"BOE direct API failed ({e}). Falling back to FRED UKASSETS (ends ~2014).")
         try:
-            # UKASSETS: GBP millions, monthly, ends ~2014 — useful for history only
-            boe_gbp = fetch_fred("UKASSETS", start)
+            boe_gbp = fetch_fred("UKASSETS", start)   # GBP millions, monthly
             gbp_usd = fx("DEXUSUK")
             return (safe_reindex(boe_gbp, gbp_usd) * gbp_usd / 1_000).rename("BOE")
         except Exception as e2:
@@ -156,17 +164,20 @@ def get_boe(start: str) -> pd.Series:
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
     """
-    Bank of Canada total assets via the Valet API (JSON, more reliable than CSV).
-    Series: B2_TOTA = total assets, CAD millions, weekly.
+    Bank of Canada total assets via Valet API (JSON).
+    The JSON structure is:
+      { "seriesDetail": {...}, "observations": [ {"d": "YYYY-MM-DD", "B2_TOTA": {"v": "123"}}, ... ] }
+    Series B2_TOTA = total assets, CAD millions, weekly.
     """
+    import requests
     try:
-        import requests
         url = (
-            f"https://www.bankofcanada.ca/valet/observations/B2_TOTA/json"
+            "https://www.bankofcanada.ca/valet/observations/B2_TOTA/json"
             f"?start_date={start}"
         )
-        data = requests.get(url, timeout=20).json()
-        obs  = data["observations"]
+        data = requests.get(url, timeout=30).json()
+        # Key is "observations" — a list of dicts with "d" and series name
+        obs    = data["observations"]          # list of {"d": date, "B2_TOTA": {"v": val}}
         dates  = pd.to_datetime([o["d"] for o in obs])
         values = pd.to_numeric([o["B2_TOTA"]["v"] for o in obs], errors="coerce")
         assets_cad_m = pd.Series(values, index=dates).dropna()
@@ -180,32 +191,56 @@ def get_boc(start: str) -> pd.Series:
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_rba(start: str) -> pd.Series:
     """
-    RBA total assets from RBA's own statistics table A1 (CSV).
-    Column 'Assets; Total assets' in AUD millions, weekly.
+    RBA total assets from RBA Table A1 CSV.
+    The RBA CSV has a metadata block at the top. The structure is:
+      Row 0: table title
+      Row 1: series descriptions  (e.g. "Total assets")
+      Row 2: series IDs           (e.g. ARBALCRAW)
+      Row 3: frequency
+      Row 4: units                (e.g. $ millions)
+      Row 5: source
+      Row 6: publication date
+      Row 7+: blank then data with "Date" in col 0
+    We find the data start by scanning for the first parseable date in col 0.
+    Total assets series ID is ARBALCRAW.
     """
+    import io, requests
     try:
-        url = "https://www.rba.gov.au/statistics/tables/csv/a1-data.csv"
-        # Skip the multi-row header block; find the real header row dynamically
-        raw = pd.read_csv(url, header=None, dtype=str)
-        # The date column header is usually 'Series ID' or blank; find the row
-        # where the first cell looks like a date (YYYY-MM-DD or DD-Mon-YYYY)
+        url  = "https://www.rba.gov.au/statistics/tables/csv/a1-data.csv"
+        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        lines = resp.text.strip().splitlines()
+
+        # Find the row index of the series-ID row (contains "ARBALCRAW")
+        series_id_row = next(
+            (i for i, ln in enumerate(lines) if "ARBALCRAW" in ln), None
+        )
+        # Find the header row (contains "Date" in first column)
         header_row = next(
-            i for i, row in raw.iterrows()
-            if str(row.iloc[0]).strip().lower() in ("series id", "date", "")
-               and pd.to_datetime(str(raw.iloc[i+1, 0]), errors="coerce") is not pd.NaT
+            (i for i, ln in enumerate(lines)
+             if ln.split(",")[0].strip().lower() == "date"), None
         )
-        df = pd.read_csv(url, skiprows=header_row + 1, header=0, dtype=str)
-        df.columns = df.columns.str.strip()
-        date_col = df.columns[0]
-        # Find 'Total assets' column — RBA labels it consistently
-        asset_col = next(
-            (c for c in df.columns if "total assets" in c.lower()), None
+        if series_id_row is None or header_row is None:
+            raise ValueError("Could not find series ID row or Date header in RBA CSV.")
+
+        # Read column positions from the series-ID row
+        id_cols = lines[series_id_row].split(",")
+        total_assets_col = next(
+            (i for i, v in enumerate(id_cols) if "ARBALCRAW" in v), None
         )
-        if not asset_col:
-            raise ValueError(f"'Total assets' column not found. Columns: {list(df.columns)}")
+        if total_assets_col is None:
+            raise ValueError("ARBALCRAW not found in series ID row.")
+
+        # Read the data block
+        df = pd.read_csv(
+            io.StringIO("\n".join(lines[header_row:])),
+            header=0, dtype=str
+        )
+        date_col  = df.columns[0]
+        value_col = df.columns[total_assets_col]
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         df = df.dropna(subset=[date_col]).set_index(date_col)
-        assets_aud_m = pd.to_numeric(df[asset_col].str.replace(",", ""), errors="coerce").dropna()
+        assets_aud_m = pd.to_numeric(df[value_col].str.replace(",", ""), errors="coerce").dropna()
         assets_aud_m = resample(assets_aud_m)
         aud_usd = fx("DEXUSAL")
         return (safe_reindex(assets_aud_m, aud_usd) * aud_usd / 1_000).rename("RBA")
@@ -216,37 +251,36 @@ def get_rba(start: str) -> pd.Series:
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_snb(start: str) -> pd.Series:
     """
-    SNB total assets from SNB's own data portal (JSON API).
-    Dataset: snb_id=BSSNB, position ATASSET (total assets, CHF millions, monthly).
-    Falls back to SNBFORCURPOS (foreign currency investments ~95% of SNB assets)
-    as a close proxy if the primary fetch fails.
+    SNB total assets via SNB data portal CSV API.
+    Cube: snbbipo (SNB balance sheet), dimension D0=ATASSET (total assets), CHF millions, monthly.
+    API pattern: https://data.snb.ch/api/cube/{cube}/data/csv/en?dimSel=D0(ATASSET)&fromDate=YYYY-MM
+    Falls back to FRED SNBFORCURPOS (foreign currency positions, ~95% of SNB assets).
     """
+    import io, requests
     try:
-        import requests
-        # SNB open data API — returns monthly total assets in CHF millions
+        from_date = start[:7]   # YYYY-MM
         url = (
-            "https://data.snb.ch/api/cube/snbbipo/data/json"
-            "?fromDate=" + start[:7]   # YYYY-MM
+            f"https://data.snb.ch/api/cube/snbbipo/data/csv/en"
+            f"?dimSel=D0(ATASSET)&fromDate={from_date}"
         )
-        data   = requests.get(url, timeout=20).json()
-        series = {
-            item["date"]: item["value"]
-            for item in data["data"]
-            if item.get("position") == "ATASSET" and item.get("currency") == "CHF"
-        }
-        if not series:
-            raise ValueError("ATASSET position not found in SNB JSON response.")
-        snb_chf_m = pd.Series(series).rename_axis("date")
-        snb_chf_m.index = pd.to_datetime(snb_chf_m.index)
-        snb_chf_m = pd.to_numeric(snb_chf_m, errors="coerce").dropna()
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        # SNB CSV format: semicolon-delimited, columns: Date;D0;Value
+        df = pd.read_csv(io.StringIO(resp.text), sep=";")
+        df.columns = df.columns.str.strip()
+        # Expect columns: Date, D0 (dimension label), Value
+        date_col  = next(c for c in df.columns if "date" in c.lower())
+        value_col = next(c for c in df.columns if "value" in c.lower())
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        snb_chf_m = pd.to_numeric(df[value_col], errors="coerce").dropna()
         snb_chf_b = resample(snb_chf_m) / 1_000   # CHF millions → billions
         chf_per_usd = fx("DEXSZUS")
         return (safe_reindex(snb_chf_b, chf_per_usd) / chf_per_usd).rename("SNB")
     except Exception as e:
         st.warning(f"SNB primary API failed ({e}). Falling back to FRED SNBFORCURPOS proxy.")
         try:
-            # SNBFORCURPOS = foreign currency investments, CHF millions
-            # Covers ~95% of SNB total assets — good enough proxy
+            # SNBFORCURPOS = foreign currency investments, CHF millions (~95% of total assets)
             snb_chf_m   = fetch_fred("SNBFORCURPOS", start)
             chf_per_usd = fx("DEXSZUS")
             return (safe_reindex(snb_chf_m, chf_per_usd) / chf_per_usd / 1_000).rename("SNB")
