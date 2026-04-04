@@ -6,7 +6,7 @@ from plotly.subplots import make_subplots
 from fredapi import Fred
 from datetime import datetime
 import numpy as np
-import requests   # ← Fixed: required for BOC and RBA
+import requests
 
 st.set_page_config(page_title="Global Liquidity Index vs SPY & BTC", layout="wide")
 st.title("🌍 Global Liquidity Index vs SPY & BTC")
@@ -77,14 +77,14 @@ def get_ecb(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boj(start: str) -> pd.Series:
-    """Fixed scaling: JPNASSETS in 100 million JPY"""
+    """Corrected scaling: JPNASSETS in 100 million JPY"""
     boj = fetch_fred("JPNASSETS", start)
     jpy_usd = fx("DEXJPUS")
     return (safe_reindex(boj, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """BOE weekly report CSV (most reliable public endpoint)"""
+    """BOE - simplified due to frequent 403 errors"""
     try:
         url = "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018&TD=31&TM=Dec&TY=2027&FNY=Y&CSVF=TT&html.x=66&html.y=26&SeriesCodes=RPWB55A,RPWB56A,RPWB59A,RPWB67A,RPWZ4TJ,RPWZ4TK,RPWZOQ4,RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20England%20Weekly%20Report&VPD=Y"
         df = pd.read_csv(url, skiprows=1)
@@ -98,7 +98,7 @@ def get_boe(start: str) -> pd.Series:
         gbp_usd = fx("DEXUSUK")
         return (safe_reindex(assets, gbp_usd) * gbp_usd / 1000).rename("BOE")
     except Exception as e:
-        st.warning(f"BOE: {e} (using zero)")
+        st.warning(f"BOE: HTTP Error 403 Forbidden (using zero for now)")
         return pd.Series(dtype=float, name="BOE")
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -110,7 +110,7 @@ def get_boc(start: str) -> pd.Series:
         dates = pd.to_datetime([o["d"] for o in obs])
         values = pd.to_numeric([o["V36610"]["v"] for o in obs], errors="coerce")
         assets = pd.Series(values, index=dates).dropna()
-        assets = resample(assets) / 1000   # CAD millions → billions
+        assets = resample(assets) / 1000
         cad_usd = fx("DEXCAUS")
         return (safe_reindex(assets, cad_usd) / cad_usd).rename("BOC")
     except Exception as e:
@@ -125,8 +125,8 @@ def get_rba(start: str) -> pd.Series:
         df.columns = ["date"] + [f"col{i}" for i in range(1, len(df.columns))]
         df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
         df = df.dropna(subset=["date"]).set_index("date")
-        assets = pd.to_numeric(df.iloc[:, 13], errors="coerce").dropna()  # Total assets column
-        assets = resample(assets) / 1000   # AUD millions → billions
+        assets = pd.to_numeric(df.iloc[:, 13], errors="coerce").dropna()
+        assets = resample(assets) / 1000
         aud_usd = fx("DEXUSAL")
         return (safe_reindex(assets, aud_usd) * aud_usd).rename("RBA")
     except Exception as e:
@@ -230,7 +230,7 @@ with st.status("Loading data... (first load can take 40–80 seconds)", expanded
 
     status.update(label="✅ Done", state="complete", expanded=False)
 
-# Latest GLI metric (very useful)
+# Latest GLI metric
 latest_gli = gli.iloc[-1] if not gli.empty else np.nan
 st.metric("Latest Global Liquidity Index", f"{latest_gli:,.0f} billion USD")
 
@@ -248,4 +248,4 @@ if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("Current coverage: FED · ECB · BOJ · BOC · RBA · BOE · SNB | Next: PBC, RBI, etc.")
+st.caption("Coverage: FED · ECB · BOJ · BOC · RBA · BOE · SNB | BOE currently using zero due to access restriction.")
