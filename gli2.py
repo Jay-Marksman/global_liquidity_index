@@ -77,29 +77,16 @@ def get_ecb(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boj(start: str) -> pd.Series:
-    """Corrected scaling: JPNASSETS in 100 million JPY"""
+    """Correct scaling: JPNASSETS unit = 100 million JPY"""
     boj = fetch_fred("JPNASSETS", start)
     jpy_usd = fx("DEXJPUS")
     return (safe_reindex(boj, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """BOE - simplified due to frequent 403 errors"""
-    try:
-        url = "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018&TD=31&TM=Dec&TY=2027&FNY=Y&CSVF=TT&html.x=66&html.y=26&SeriesCodes=RPWB55A,RPWB56A,RPWB59A,RPWB67A,RPWZ4TJ,RPWZ4TK,RPWZOQ4,RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20England%20Weekly%20Report&VPD=Y"
-        df = pd.read_csv(url, skiprows=1)
-        df.columns = df.columns.str.strip()
-        date_col = next(c for c in df.columns if "date" in c.lower() or "period" in c.lower())
-        asset_col = next(c for c in df.columns if "total asset" in str(c).lower() and "liability" not in str(c).lower())
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col]).set_index(date_col)
-        assets = pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
-        assets = resample(assets)
-        gbp_usd = fx("DEXUSUK")
-        return (safe_reindex(assets, gbp_usd) * gbp_usd / 1000).rename("BOE")
-    except Exception as e:
-        st.warning(f"BOE: HTTP Error 403 Forbidden (using zero for now)")
-        return pd.Series(dtype=float, name="BOE")
+    """BOE temporarily disabled due to 403. Can be re-enabled with alternative source."""
+    st.info("BOE data temporarily skipped (access restricted).")
+    return pd.Series(dtype=float, name="BOE")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
@@ -143,7 +130,7 @@ def get_snb(start: str) -> pd.Series:
         st.warning(f"SNB: {e}")
         return pd.Series(dtype=float, name="SNB")
 
-# ── Build GLI (robust) ─────────────────────────────────────────────────────────
+# ── Build GLI (robust, prevents negative artifacts) ────────────────────────────
 def build_gli(components: dict) -> pd.Series:
     def get(key):
         s = components.get(key, pd.Series(dtype=float))
@@ -204,7 +191,7 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main Execution ─────────────────────────────────────────────────────────────
 with st.status("Loading data... (first load can take 40–80 seconds)", expanded=True) as status:
     components = {}
     steps = [
@@ -230,7 +217,7 @@ with st.status("Loading data... (first load can take 40–80 seconds)", expanded
 
     status.update(label="✅ Done", state="complete", expanded=False)
 
-# Latest GLI metric
+# Latest GLI metric (always visible)
 latest_gli = gli.iloc[-1] if not gli.empty else np.nan
 st.metric("Latest Global Liquidity Index", f"{latest_gli:,.0f} billion USD")
 
@@ -248,4 +235,4 @@ if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("Coverage: FED · ECB · BOJ · BOC · RBA · BOE · SNB | BOE currently using zero due to access restriction.")
+st.caption("Coverage: FED · ECB · BOJ · BOC · RBA · SNB (BOE temporarily skipped due to access restriction)")
