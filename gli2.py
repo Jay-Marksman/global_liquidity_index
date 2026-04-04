@@ -116,11 +116,12 @@ def get_boj(start: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boe(start: str) -> pd.Series:
-    """Bank of England weekly total assets - official CSV endpoint"""
+    """Bank of England weekly total assets"""
     try:
         import requests
         import io
 
+        # Official CSV endpoint
         url = (
             "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?"
             "Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018"
@@ -130,20 +131,16 @@ def get_boe(start: str) -> pd.Series:
             "England%20Weekly%20Report&VPD=Y"
         )
 
-        # Fetch with proper headers to reduce blocks
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         resp.raise_for_status()
 
-        # Safety check: if the response looks like HTML (error page), abort
         text = resp.text.strip()
-        if text.startswith("<!DOCTYPE") or "<html" in text.lower() or "error" in text.lower():
+        if text.startswith("<!DOCTYPE") or "<html" in text.lower():
             raise ValueError("Received HTML error page instead of CSV")
 
-        # Parse as CSV
         df = pd.read_csv(io.StringIO(text), skiprows=1)
         df.columns = df.columns.str.strip()
 
-        # Dynamically locate columns
         date_col = next((c for c in df.columns if "date" in c.lower() or "period" in c.lower()), None)
         asset_col = next((c for c in df.columns if "total asset" in str(c).lower() and "liability" not in str(c).lower()), None)
 
@@ -159,9 +156,16 @@ def get_boe(start: str) -> pd.Series:
         return (safe_reindex(assets, gbp_usd) * gbp_usd / 1000).rename("BOE")
 
     except Exception as e:
-        st.warning(f"BOE fetch failed: {e} (using zero for now)")
-        return pd.Series(dtype=float, name="BOE")
-        
+        st.warning(f"BOE fetch failed: {e} → falling back to FRED UKASSETS")
+        try:
+            # FRED fallback (historical data only)
+            boe_gbp = fetch_fred("UKASSETS", start)
+            gbp_usd = fx("DEXUSUK")
+            return (safe_reindex(boe_gbp, gbp_usd) * gbp_usd / 1000).rename("BOE")
+        except Exception as e2:
+            st.warning(f"BOE FRED fallback also failed: {e2} (using zero)")
+            return pd.Series(dtype=float, name="BOE")
+            
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_boc(start: str) -> pd.Series:
     """
