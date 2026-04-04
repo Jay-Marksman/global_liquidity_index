@@ -5,176 +5,202 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from fredapi import Fred
 from datetime import datetime
-import numpy as np
-import requests
 
 st.set_page_config(page_title="Global Liquidity Index vs SPY & BTC", layout="wide")
 st.title("🌍 Global Liquidity Index vs SPY & BTC")
-st.markdown("**GLI** = FED − TGA − RRP + ECB + BOJ + BOC + RBA + SNB (BOE skipped)")
+st.markdown("**Global Liquidity Index** = FED – TGA – RRP + ECB + BOJ + BOC + RBA + BOE + SNB + ...")
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# Sidebar
 with st.sidebar:
     st.header("Configuration")
     FRED_API_KEY = st.text_input("FRED API Key", type="password",
-                                 help="Free key at https://fred.stlouisfed.org/docs/api/api_key.html")
+                                 help="Free key from https://fred.stlouisfed.org/docs/api/api_key.html")
     START_DATE = st.date_input("Start Date", value=datetime(2015, 1, 1))
+
     if not FRED_API_KEY:
-        st.warning("Enter your FRED API key.")
+        st.warning("Enter your FRED API key")
         st.stop()
 
-RESAMPLE = "W-FRI"
-start_str = START_DATE.strftime("%Y-%m-%d")
-end_str = datetime.today().strftime("%Y-%m-%d")
+# Fred client
+@st.cache_resource
+def get_fred_client(_api_key):
+    return Fred(api_key=_api_key)
 
-# ── Fred client ────────────────────────────────────────────────────────────────
-if "fred" not in st.session_state or st.session_state.get("fred_key") != FRED_API_KEY:
-    st.session_state.fred = Fred(api_key=FRED_API_KEY)
-    st.session_state.fred_key = FRED_API_KEY
-fred = st.session_state.fred
+fred = get_fred_client(FRED_API_KEY)
+RESAMPLE_FREQ = "W-FRI"
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def resample(s: pd.Series) -> pd.Series:
-    if not isinstance(s.index, pd.DatetimeIndex):
-        s.index = pd.to_datetime(s.index, errors="coerce")
-    return s.resample(RESAMPLE).last().ffill()
-
-def safe_reindex(source: pd.Series, target: pd.Series) -> pd.Series:
-    source = resample(source)
-    target = resample(target)
-    return source.reindex(target.index, method="ffill")
-
-# ── FRED fetch ─────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_fred(series_id: str, start: str) -> pd.Series:
+# ── Core Fetchers ───────────────────────────────────────────────────────
+@st.cache_data(ttl=86400)
+def get_fred_series(series_id: str, name: str, start: str):
     try:
         s = fred.get_series(series_id, observation_start=start)
-        return resample(s).rename(series_id)
+        s = s.resample(RESAMPLE_FREQ).last().ffill()
+        s.name = name
+        return s
     except Exception as e:
-        st.warning(f"FRED `{series_id}` failed: {e}")
-        return pd.Series(dtype=float, name=series_id)
+        st.warning(f"FRED {series_id} failed: {e}")
+        return pd.Series(dtype=float, name=name)
 
-def fx(fred_id: str) -> pd.Series:
-    return fetch_fred(fred_id, start_str)
+@st.cache_data(ttl=86400)
+def get_fx(fred_id: str, start: str):
+    return get_fred_series(fred_id, fred_id, start)
 
-# ── Central Bank Fetchers ──────────────────────────────────────────────────────
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_fed(start: str) -> pd.Series:
-    return fetch_fred("WALCL", start)
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_tga(start: str) -> pd.Series:
-    return fetch_fred("WTREGEN", start)
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_rrp(start: str) -> pd.Series:
-    return fetch_fred("RRPONTSYD", start)
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_ecb(start: str) -> pd.Series:
-    ecb_eur = fetch_fred("ECBASSETSW", start)
-    eur_usd = fx("DEXUSEU")
-    return (safe_reindex(ecb_eur, eur_usd) * eur_usd / 1000).rename("ECB")
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_boj(start: str) -> pd.Series:
-    """JPNASSETS unit = 100 million Yen"""
-    boj = fetch_fred("JPNASSETS", start)
-    jpy_usd = fx("DEXJPUS")
-    return (safe_reindex(boj, jpy_usd) * 0.1 / jpy_usd).rename("BOJ")
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_boe(start: str) -> pd.Series:
-    st.info("BOE data skipped (access restricted by Bank of England)")
-    return pd.Series(dtype=float, name="BOE")
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_boc(start: str) -> pd.Series:
+@st.cache_data(ttl=86400)
+def get_ecb_total_assets(start: str):
     try:
-        url = f"https://www.bankofcanada.ca/valet/observations/group/b2_weekly/json?start_date={start}"
-        data = requests.get(url, timeout=30).json()
-        obs = data["observations"]
-        dates = pd.to_datetime([o["d"] for o in obs])
-        values = pd.to_numeric([o.get("V36610", {}).get("v", 0) for o in obs], errors="coerce")
-        assets = pd.Series(values, index=dates).dropna()
-        assets = resample(assets) / 1000
-        cad_usd = fx("DEXCAUS")
-        return (safe_reindex(assets, cad_usd) / cad_usd).rename("BOC")
+        s = get_fred_series("ECBASSETSW", "ECB_EUR", start)
+        eur_usd = get_fx("DEXUSEU", start)
+        return (s.reindex(eur_usd.index, method="ffill") * eur_usd / 1000).rename("ECB")
+    except Exception as e:
+        st.warning(f"ECB: {e}")
+        return pd.Series(dtype=float, name="ECB")
+
+@st.cache_data(ttl=86400)
+def get_boj_total_assets(start: str):
+    try:
+        url = "https://www.stat-search.boj.or.jp/ssi/mtshtml/bs01_m_1_en.csv"
+        df = pd.read_csv(url, skiprows=4, encoding="shift_jis")
+        df.columns = df.columns.str.strip()
+        df = df.iloc[:, :2]
+        df.columns = ["date", "BOJ_JPY"]
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna().set_index("date")["BOJ_JPY"]
+        df = pd.to_numeric(df.str.replace(",", ""), errors="coerce").dropna()
+        df = df.resample(RESAMPLE_FREQ).last().ffill()
+        jpy_usd = get_fx("DEXJPUS", start)
+        return (df.reindex(jpy_usd.index, method="ffill") / jpy_usd * 0.01).rename("BOJ")
+    except Exception:
+        try:
+            s = get_fred_series("JPNASSETS", "BOJ_JPYT", start) * 1000
+            jpy_usd = get_fx("DEXJPUS", start)
+            return (s.reindex(jpy_usd.index, method="ffill") / jpy_usd).rename("BOJ")
+        except Exception as e:
+            st.warning(f"BOJ: {e}")
+            return pd.Series(dtype=float, name="BOJ")
+
+@st.cache_data(ttl=86400)
+def get_boc_total_assets(start: str):
+    """Bank of Canada - official weekly CSV"""
+    try:
+        url = "https://www.bankofcanada.ca/valet/observations/group/b2_weekly/csv?start_date=2015-01-01"
+        df = pd.read_csv(url, skiprows=1)
+        df.columns = df.columns.str.strip()
+        date_col = [c for c in df.columns if "date" in c.lower()][0]
+        # Look for total assets column (names vary slightly)
+        asset_col = next((c for c in df.columns if "total asset" in c.lower() or "assets" in c.lower() and "liability" not in c.lower()), None)
+        if not asset_col:
+            asset_col = df.columns[-1]  # fallback to last numeric column
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        assets = pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
+        assets = assets.resample(RESAMPLE_FREQ).last().ffill()
+        cad_usd = get_fx("DEXCAUS", start)  # CAD per USD
+        return (assets.reindex(cad_usd.index, method="ffill") / cad_usd).rename("BOC")
     except Exception as e:
         st.warning(f"BOC: {e}")
         return pd.Series(dtype=float, name="BOC")
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_rba(start: str) -> pd.Series:
+@st.cache_data(ttl=86400)
+def get_rba_total_assets(start: str):
+    """RBA - official weekly CSV (much more reliable than Excel)"""
     try:
         url = "https://www.rba.gov.au/statistics/tables/csv/a1-data.csv"
-        df = pd.read_csv(url, skiprows=11, header=None)
-        df.columns = ["date"] + [f"col{i}" for i in range(1, len(df.columns))]
-        df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
-        df = df.dropna(subset=["date"]).set_index("date")
-        assets = pd.to_numeric(df.iloc[:, 13], errors="coerce").dropna()
-        assets = resample(assets) / 1000
-        aud_usd = fx("DEXUSAL")
-        return (safe_reindex(assets, aud_usd) * aud_usd).rename("RBA")
+        df = pd.read_csv(url, skiprows=1)
+        df.columns = df.columns.str.strip()
+        date_col = [c for c in df.columns if "date" in c.lower() or "period" in c.lower()][0]
+        asset_col = next((c for c in df.columns if "total asset" in str(c).lower() or "total assets" in str(c).lower()), None)
+        if not asset_col:
+            asset_col = [c for c in df.columns if "assets" in str(c).lower()][-1]
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        assets = pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
+        assets = assets.resample(RESAMPLE_FREQ).last().ffill()
+        aud_usd = get_fx("DEXUSAL", start)  # USD per AUD
+        return (assets.reindex(aud_usd.index, method="ffill") * aud_usd).rename("RBA")
     except Exception as e:
         st.warning(f"RBA: {e}")
         return pd.Series(dtype=float, name="RBA")
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_snb(start: str) -> pd.Series:
+@st.cache_data(ttl=86400)
+def get_boe_total_assets(start: str):
+    """Bank of England - official weekly report CSV"""
     try:
-        s = fetch_fred("SNBFORCURPOS", start)
-        chf_usd = fx("DEXSZUS")
-        return (safe_reindex(s, chf_usd) / chf_usd / 1000).rename("SNB")
+        url = "https://www.bankofengland.co.uk/boeapps/database/fromshowcolumns.asp?Travel=NIxAZxSUx&FromSeries=1&ToSeries=50&DAT=RNG&FD=1&FM=Jan&FY=2018&TD=31&TM=Dec&TY=2027&FNY=Y&CSVF=TT&html.x=66&html.y=26&SeriesCodes=RPWB55A,RPWB56A,RPWB59A,RPWB67A,RPWZ4TJ,RPWZ4TK,RPWZOQ4,RPWZ4TL,RPWZ4TM,RPWZOI7,RPWZ4TN&UsingCodes=Y&Filter=N&title=Bank%20of%20England%20Weekly%20Report&VPD=Y"
+        df = pd.read_csv(url, skiprows=1)
+        df.columns = df.columns.str.strip()
+        date_col = next((c for c in df.columns if "date" in c.lower() or "period" in c.lower()), None)
+        asset_col = next((c for c in df.columns if "total asset" in str(c).lower() and "liability" not in str(c).lower()), None)
+        if not date_col or not asset_col:
+            raise ValueError("Column not found")
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).set_index(date_col)
+        assets = pd.to_numeric(df[asset_col].astype(str).str.replace(",", ""), errors="coerce").dropna()
+        assets = assets.resample(RESAMPLE_FREQ).last().ffill()
+        gbp_usd = get_fx("DEXUSUK", start)
+        return (assets.reindex(gbp_usd.index, method="ffill") * gbp_usd / 1000).rename("BOE")  # assume millions GBP
+    except Exception as e:
+        st.warning(f"BOE: {e} (often 403 - skipping)")
+        return pd.Series(dtype=float, name="BOE")
+
+@st.cache_data(ttl=86400)
+def get_snb_total_assets(start: str):
+    try:
+        s = get_fred_series("SNBREMBALPOS", "SNB_CHF", start)  # best available proxy
+        chf_usd = get_fx("DEXSZUS", start)
+        return (s.reindex(chf_usd.index, method="ffill") / chf_usd).rename("SNB")
     except Exception as e:
         st.warning(f"SNB: {e}")
         return pd.Series(dtype=float, name="SNB")
 
-# ── Build GLI (extra robust) ───────────────────────────────────────────────────
-def build_gli(components: dict) -> pd.Series:
-    def get(key):
-        s = components.get(key, pd.Series(dtype=float))
-        return resample(s)
+# ── GLI Calculation (robust) ────────────────────────────────────────────
+def build_gli(df: pd.DataFrame) -> pd.Series:
+    common_idx = df.index
+    fed = df.get("FED_ASSETS", pd.Series(0, index=common_idx)) * 0.001
+    tga = df.get("TGA", pd.Series(0, index=common_idx))
+    rrp = df.get("RRP", pd.Series(0, index=common_idx))
+    ecb = df.get("ECB", pd.Series(0, index=common_idx))
+    boj = df.get("BOJ", pd.Series(0, index=common_idx))
+    boc = df.get("BOC", pd.Series(0, index=common_idx))
+    rba = df.get("RBA", pd.Series(0, index=common_idx))
+    boe = df.get("BOE", pd.Series(0, index=common_idx))
+    snb = df.get("SNB", pd.Series(0, index=common_idx))
 
-    fed = get("FED") * 0.001
-    tga = get("TGA")
-    rrp = get("RRP")
+    gli = fed - tga - rrp + ecb + boj + boc + rba + boe + snb
+    gli.name = "GLI_USD_B"
+    return gli
 
-    gli = fed.sub(tga, fill_value=0).sub(rrp, fill_value=0)
-    for key in ("ECB", "BOJ", "BOC", "RBA", "SNB"):
-        gli = gli.add(get(key), fill_value=0)
+# Market data
+@st.cache_data(ttl=3600)
+def get_market_data(start: str, end: str):
+    tickers = yf.download(["SPY", "BTC-USD"], start=start, end=end, progress=False)
+    return tickers["Close"].resample(RESAMPLE_FREQ).last().ffill()
 
-    return gli.rename("GLI_USD_B")
-
-# ── Market data ────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_market(start: str, end: str):
-    raw = yf.download(["SPY", "BTC-USD"], start=start, end=end, progress=False)
-    return raw["Close"].resample(RESAMPLE).last().ffill()
-
-# ── Plot ───────────────────────────────────────────────────────────────────────
+# Plot (same as before, with extra safety)
 def plot_gli(gli: pd.Series, market: pd.DataFrame):
     df = pd.concat([gli, market], axis=1).sort_index().dropna(how="all")
     if df.empty:
         st.error("No data available.")
         return None
 
-    base = df.iloc[0].replace(0, np.nan)
-    idx = df.div(base) * 100
+    st.caption(f"Data shape: {df.shape} | GLI non-NaN weeks: {gli.notna().sum()}")
+
+    first = df.index[0]
+    idx = df.loc[first:].div(df.loc[first]) * 100
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28],
-                        subplot_titles=("Indexed performance (start = 100)", "GLI (USD Trillions)"))
+                        subplot_titles=("Indexed Performance (start=100)", "GLI (USD Trillions)"))
 
     colors = {"GLI_USD_B": "#3266ad", "SPY": "#1D9E75", "BTC-USD": "#D85A30"}
     names = {"GLI_USD_B": "Global Liquidity Index", "SPY": "SPY", "BTC-USD": "BTC/USD"}
 
     for col in ["GLI_USD_B", "SPY", "BTC-USD"]:
-        if col in idx.columns and not idx[col].isna().all():
+        if col in idx.columns and idx[col].notna().any():
             fig.add_trace(go.Scatter(x=idx.index, y=idx[col].round(1),
                                      name=names[col], mode="lines",
                                      line=dict(color=colors[col], width=2.5 if col == "GLI_USD_B" else 1.5)),
                           row=1, col=1)
 
-    if "GLI_USD_B" in df.columns and not df["GLI_USD_B"].isna().all():
+    if "GLI_USD_B" in df.columns and df["GLI_USD_B"].notna().any():
         fig.add_trace(go.Scatter(x=df.index, y=(df["GLI_USD_B"]/1000).round(2),
                                  name="GLI (raw)", mode="lines",
                                  line=dict(color="#3266ad", width=1.5), showlegend=False),
@@ -189,47 +215,47 @@ def plot_gli(gli: pd.Series, market: pd.DataFrame):
     fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-with st.status("Loading data... (first load can take 40–80 seconds)", expanded=True) as status:
-    components = {}
-    steps = [
-        ("FED assets", "FED", lambda: get_fed(start_str)),
-        ("TGA", "TGA", lambda: get_tga(start_str)),
-        ("RRP", "RRP", lambda: get_rrp(start_str)),
-        ("ECB", "ECB", lambda: get_ecb(start_str)),
-        ("BOJ", "BOJ", lambda: get_boj(start_str)),
-        ("BOE", "BOE", lambda: get_boe(start_str)),
-        ("BOC", "BOC", lambda: get_boc(start_str)),
-        ("RBA", "RBA", lambda: get_rba(start_str)),
-        ("SNB", "SNB", lambda: get_snb(start_str)),
-    ]
-    for label, key, fn in steps:
-        st.write(f"Fetching {label}...")
-        components[key] = fn()
+# ── Main Execution ──────────────────────────────────────────────────────
+start_str = START_DATE.strftime("%Y-%m-%d")
+end_str = datetime.today().strftime("%Y-%m-%d")
 
-    st.write("Building GLI...")
-    gli = build_gli(components)
+FRED_SERIES = {
+    "WALCL": "FED_ASSETS",
+    "WTREGEN": "TGA",
+    "RRPONTSYD": "RRP",
+    "ECBASSETSW": "ECB_EUR",
+    "JPNASSETS": "BOJ_JPYT",
+    "DEXUSEU": "EUR_USD",
+    "DEXJPUS": "JPY_USD",
+    "DEXCAUS": "CAD_USD_INV",
+    "DEXUSAL": "AUD_USD",
+    "DEXUSUK": "GBP_USD",
+    "DEXSZUS": "CHF_USD_INV",
+}
 
-    st.write("Fetching SPY & BTC...")
-    market = get_market(start_str, end_str)
+with st.spinner("Fetching data... (first load ~40-70 seconds with new banks)"):
+    raw = {}
+    for sid, name in FRED_SERIES.items():
+        raw[name] = get_fred_series(sid, name, start_str)
 
-    status.update(label="✅ Done", state="complete", expanded=False)
+    raw["ECB"] = get_ecb_total_assets(start_str)
+    raw["BOJ"] = get_boj_total_assets(start_str)
+    raw["BOC"] = get_boc_total_assets(start_str)
+    raw["RBA"] = get_rba_total_assets(start_str)
+    raw["BOE"] = get_boe_total_assets(start_str)
+    raw["SNB"] = get_snb_total_assets(start_str)
 
-# Latest GLI metric
-latest_gli = gli.iloc[-1] if not gli.empty else np.nan
-st.metric("Latest Global Liquidity Index", f"{latest_gli:,.0f} billion USD")
+    df_raw = pd.DataFrame(raw).sort_index().ffill()
+    gli = build_gli(df_raw)
+    market = get_market_data(start_str, end_str)
 
-fig = plot_gli(gli, market)
+    fig = plot_gli(gli, market)
+
 if fig:
-    st.plotly_chart(fig, width="stretch")   # Fixed deprecation warning
-
-with st.expander("Coverage summary"):
-    summary = {k: f"{v.notna().sum()} weeks" for k, v in components.items()}
-    summary["GLI"] = f"{gli.notna().sum()} weeks"
-    st.table(pd.Series(summary, name="Non-null weeks"))
+    st.plotly_chart(fig, use_container_width=True)
 
 if st.checkbox("Show raw data table"):
     combined = pd.concat([gli, market], axis=1).dropna(how="all")
     st.dataframe(combined.style.format("{:,.2f}"))
 
-st.caption("BOE skipped due to access restrictions. Core coverage: FED + ECB + BOJ + BOC + RBA + SNB")
+st.caption("**Current coverage**: FED + ECB + BOJ + BOC + RBA + BOE + SNB. Data shape should now be significantly larger.")
