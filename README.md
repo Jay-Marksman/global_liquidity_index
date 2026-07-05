@@ -6,4 +6,4 @@ Install:
     pip install streamlit pandas yfinance plotly fredapi requests
 
 Run:
-    streamlit run global_liquidity_index.py
+    streamlit run gli2.py
